@@ -1,0 +1,38 @@
+# 环境与密钥
+.env
+backend/.env
+**/.env
+!.env.example
+!backend/.env.example
+
+# 运行时数据
+backend/data/
+*.db
+*.db-journal
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# Node
+frontend/node_modules/
+frontend/dist/
+npm-debug.log*
+
+# IDE / OS
+.idea/
+.vscode/
+.cursor/
+*.swp
+.DS_Store
+Thumbs.db
+
+# 本地打包与临时
+*.zip
+_doc_extract.txt
+*.docx
