@@ -80,9 +80,10 @@ async def list_trades(
     items = []
     for r in rows:
         raw = r.raw or {}
-        kline_ts = raw.get("kline_close_ts") if isinstance(raw, dict) else None
-        if kline_ts:
-            ts_out = kline_ts
+        # 优先真实墙钟；不再用 K 线收盘整点覆盖展示（否则开仓都像整点）
+        wall_ts = raw.get("wall_ts") if isinstance(raw, dict) else None
+        if wall_ts:
+            ts_out = wall_ts
         else:
             created = r.created_at
             if created is not None and created.tzinfo is None:

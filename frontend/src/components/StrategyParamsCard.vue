@@ -37,7 +37,7 @@
             <el-input-number v-model="params.leverage" :min="1" :max="125" size="small" controls-position="right" />
           </div>
         </div>
-        <div class="unit" style="margin-top:8px">开仓/加仓：实时（RSI 用已收盘值 + 未收盘放量）；TP2：所选周期收盘；TP1/SL1/SL2：等下一根 1m K 收盘建立基准后按实时价触发</div>
+        <div class="unit" style="margin-top:8px">开仓/加仓：实时（未收盘价估算 RSI + 未收盘放量）；TP2：所选周期收盘；TP1/SL1/SL2：等下一根 1m K 收盘建立基准后按实时价触发</div>
       </section>
 
       <section class="block">
@@ -150,9 +150,9 @@
       <section class="block">
         <div class="block-title">止盈 / 止损（独立开关 · 先到先执行）</div>
         <div class="tp-row">
-          <el-checkbox v-model="params.exit.enable_tp1">TP1 利润回撤</el-checkbox>
+          <el-checkbox v-model="params.exit.enable_tp1">TP1 移动止盈（峰值回撤）</el-checkbox>
           <el-input-number v-model="params.exit.tp1_drawdown_pct" :min="1" :max="99" :precision="1" size="small" controls-position="right" />
-          <span class="unit">%（实时，固定基准浮盈）</span>
+          <span class="unit">%（相对最高浮盈，实时）</span>
         </div>
         <div class="tp-row">
           <el-checkbox v-model="params.exit.enable_tp2">TP2 RSI（所选周期收盘）</el-checkbox>
@@ -176,7 +176,7 @@
           <p><b>开多：</b>已勾选条件同时满足（默认 RSI≤10 且放量）</p>
           <p><b>开空：</b>默认 RSI≥86 且放量</p>
           <p><b>加仓：</b>一级→二级严格顺序（实时）；加仓后等下一根 1m 收盘重置退出基准</p>
-          <p><b>退出：</b>TP1/SL1/SL2（1m收盘武装后实时）；TP2 RSI（所选周期收盘）</p>
+          <p><b>退出：</b>TP1 峰值移动止盈 / SL1 保本 / SL2 浮亏（1m收盘后；等基准期仍有 SL2）；TP2 RSI（所选周期收盘）</p>
         </div>
       </section>
     </template>

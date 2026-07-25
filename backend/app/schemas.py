@@ -131,7 +131,7 @@ class ExitConfig(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     enable_tp1: bool = True
-    tp1_drawdown_pct: float = 30.0          # 固定基准利润回撤 %
+    tp1_drawdown_pct: float = 30.0          # 峰值浮盈回撤 %（移动止盈）
 
     enable_tp2: bool = True
     tp2_long_rsi: float = 85.0              # 多：RSI ≥

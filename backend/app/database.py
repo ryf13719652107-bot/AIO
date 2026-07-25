@@ -47,6 +47,8 @@ async def init_db():
                 alters.append("ALTER TABLE position_state ADD COLUMN baseline_pnl FLOAT DEFAULT 0")
             if "baseline_open_ms" not in cols:
                 alters.append("ALTER TABLE position_state ADD COLUMN baseline_open_ms INTEGER DEFAULT 0")
+            if "peak_pnl" not in cols:
+                alters.append("ALTER TABLE position_state ADD COLUMN peak_pnl FLOAT DEFAULT 0")
             for sql in alters:
                 sync_conn.execute(text(sql))
 

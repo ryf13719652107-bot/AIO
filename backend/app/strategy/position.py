@@ -1,8 +1,8 @@
 """
 单币种仓位状态机。
 - 首仓 + 两级顺序加仓（各最多一次）
-- 开/加仓后等待下一根 1m K 收盘建立退出基准
-- 固定基准浮盈用于 TP1 回撤；实时浮盈用于 SL1/SL2
+- 开/加仓后等待下一根 1m K 收盘开始移动止盈
+- 武装后按峰值浮盈 peak_pnl 回撤（真正移动止盈）；SL2 等待期也生效
 """
 
 import time
@@ -29,12 +29,13 @@ class SymbolPosition:
     add_blocked: bool = False  # 交易所接管仓：禁止加仓
 
     # 退出基准
-    pending_baseline: bool = False      # 等待下一根 1m K 收盘武装
+    pending_baseline: bool = False      # 等待下一根 1m K 收盘开始 TP1
     pending_baseline_since_ms: int = 0  # 开始等待的时刻（ms）
     baseline_armed: bool = False
     baseline_price: float = 0.0         # 武装时参考价（1m 收盘价）
-    baseline_pnl: float = 0.0           # 武装时固定浮盈绝对值 P0
+    baseline_pnl: float = 0.0           # 武装时浮盈（可≤0）；展示用
     baseline_open_ms: int = 0           # 武装所用 1m K 的 open_ms
+    peak_pnl: float = 0.0               # 武装后见到的最高浮盈（移动止盈峰值）
 
     @property
     def is_flat(self) -> bool:
@@ -91,6 +92,7 @@ class SymbolPosition:
         self.baseline_price = 0.0
         self.baseline_pnl = 0.0
         self.baseline_open_ms = 0
+        self.peak_pnl = 0.0
 
     def open(self, side: Direction, quantity: float, price: float, margin: float,
              *, since_ms: Optional[int] = None):
@@ -136,7 +138,7 @@ class SymbolPosition:
 
     def arm_baseline(self, ref_price: float, open_ms: int = 0,
                      *, close_boundary_ms: int = 0) -> bool:
-        """下一根 1m K 收盘时武装固定基准浮盈 P0。"""
+        """下一根 1m K 收盘后开始移动止盈：初始化峰值。"""
         if self.is_flat or not self.pending_baseline:
             return False
         # 必须是进入等待之后的收盘，避免开仓当根立刻武装
@@ -145,12 +147,26 @@ class SymbolPosition:
                 return False
         self.mark_price = ref_price
         self.baseline_price = ref_price
-        self.baseline_pnl = self.unrealized_pnl(ref_price)
+        pnl = self.unrealized_pnl(ref_price)
+        self.baseline_pnl = pnl
+        # 峰值至少从 0 起：武装时若已亏损，等后续浮盈出现再移动止盈
+        self.peak_pnl = max(0.0, pnl)
         self.baseline_open_ms = open_ms
         self.baseline_armed = True
         self.pending_baseline = False
         self.pending_baseline_since_ms = 0
         return True
+
+    def ratchet_peak(self, mark: float) -> float:
+        """武装后上移峰值浮盈；返回当前峰值。"""
+        if self.is_flat or not self.baseline_armed or mark <= 0:
+            return self.peak_pnl
+        self.mark_price = mark
+        pnl = self.unrealized_pnl(mark)
+        if pnl > self.peak_pnl:
+            self.peak_pnl = pnl
+            self.baseline_price = mark
+        return self.peak_pnl
 
     def close(self):
         self.direction = "FLAT"
@@ -166,6 +182,7 @@ class SymbolPosition:
         self.baseline_price = 0.0
         self.baseline_pnl = 0.0
         self.baseline_open_ms = 0
+        self.peak_pnl = 0.0
 
     def to_dict(self) -> dict:
         return {
@@ -183,6 +200,7 @@ class SymbolPosition:
             "baseline_price": self.baseline_price,
             "baseline_pnl": self.baseline_pnl,
             "baseline_open_ms": self.baseline_open_ms,
+            "peak_pnl": self.peak_pnl,
             "mark_price": self.mark_price,
         }
 
@@ -196,7 +214,6 @@ class SymbolPosition:
         oa = d.get("opened_at_iso")
         if oa:
             pos.opened_at = datetime.fromisoformat(oa)
-        # 兼容旧 add_fired
         if "add_count" in d:
             pos.add_count = int(d.get("add_count", 0))
         elif d.get("add_fired"):
@@ -208,6 +225,11 @@ class SymbolPosition:
         pos.baseline_price = float(d.get("baseline_price", 0) or 0)
         pos.baseline_pnl = float(d.get("baseline_pnl", 0) or 0)
         pos.baseline_open_ms = int(d.get("baseline_open_ms", 0) or 0)
+        # 兼容旧状态：无 peak 时用 max(0, baseline_pnl)
+        if "peak_pnl" in d:
+            pos.peak_pnl = float(d.get("peak_pnl", 0) or 0)
+        else:
+            pos.peak_pnl = max(0.0, pos.baseline_pnl) if pos.baseline_armed else 0.0
         pos.mark_price = float(d.get("mark_price", 0) or 0)
         return pos
 
@@ -225,6 +247,7 @@ class SymbolPosition:
             "baseline_armed": self.baseline_armed,
             "baseline_price": self.baseline_price,
             "baseline_pnl": self.baseline_pnl,
+            "peak_pnl": self.peak_pnl,
             "unrealized_pnl": self.unrealized_pnl(),
             "unrealized_pnl_ratio": self.unrealized_pnl_ratio(),
             "mark_price": self.mark_price,

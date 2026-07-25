@@ -23,6 +23,19 @@ def test_volume_not_ready_until_lookback_plus_one():
     assert abs(vw.ratio(30) - 10.0) < 1e-9
 
 
+def test_rsi_peek_does_not_mutate():
+    rsi = RSIState(period=6)
+    prices = [100, 101, 102, 101, 100, 99, 98, 97]
+    for p in prices:
+        rsi.update(p)
+    assert rsi.initialized
+    closed = rsi.value
+    peeked = rsi.peek(90.0)  # 继续大跌 → RSI 更低
+    assert peeked is not None
+    assert peeked < closed
+    assert rsi.value == closed  # 未写入
+
+
 def test_rsi_initializes():
     rsi = RSIState(period=6)
     prices = [100, 101, 102, 101, 100, 99, 98, 97]

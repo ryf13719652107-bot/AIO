@@ -25,4 +25,5 @@ class PositionState(Base):
     baseline_price: Mapped[float] = mapped_column(Float, default=0.0)
     baseline_pnl: Mapped[float] = mapped_column(Float, default=0.0)
     baseline_open_ms: Mapped[int] = mapped_column(Integer, default=0)
+    peak_pnl: Mapped[float] = mapped_column(Float, default=0.0)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)

@@ -399,6 +399,7 @@ class StrategyEngine:
             row.baseline_price = pos.baseline_price
             row.baseline_pnl = pos.baseline_pnl
             row.baseline_open_ms = pos.baseline_open_ms
+            row.peak_pnl = pos.peak_pnl
             row.updated_at = datetime.utcnow()
             await db.commit()
 
@@ -437,6 +438,11 @@ class StrategyEngine:
             pos.baseline_price = float(row.baseline_price or 0)
             pos.baseline_pnl = float(row.baseline_pnl or 0)
             pos.baseline_open_ms = int(row.baseline_open_ms or 0)
+            peak = getattr(row, "peak_pnl", None)
+            if peak is not None:
+                pos.peak_pnl = float(peak or 0)
+            elif pos.baseline_armed:
+                pos.peak_pnl = max(0.0, pos.baseline_pnl)
             if pos.entry_price:
                 pos.mark_price = pos.entry_price
             restored += 1
@@ -1098,7 +1104,8 @@ class StrategyEngine:
             await self._persist_position(symbol)
             await self._log(
                 "INFO", symbol,
-                f"退出基准已武装(1m收盘): P0={pos.baseline_pnl:.4f} @ {close_price:.6f} "
+                f"退出基准已武装(1m收盘): 峰值={pos.peak_pnl:.4f} "
+                f"(当时浮盈={pos.baseline_pnl:.4f}) @ {close_price:.6f} "
                 f"(open_ms={open_ms})",
             )
             self.bus.publish({"type": "runtime", "data": self.runtime_snapshot()})
@@ -1176,7 +1183,12 @@ class StrategyEngine:
         if not self._trading_ready():
             return
 
-        # 实时开仓/加仓（RSI 已收盘值 + live/收盘 VOL）
+        # 用最新 mark 作为未收盘价，驱动实时 RSI peek（不写入收盘指标）
+        tf = self._trading_tf()
+        if symbol in self.indicators and mark > 0:
+            self.indicators[symbol].set_live(tf, close=mark)
+
+        # 实时开仓/加仓（live RSI + live/收盘 VOL）
         if symbol not in self._entry_busy:
             self._entry_busy.add(symbol)
             asyncio.create_task(
@@ -1184,8 +1196,10 @@ class StrategyEngine:
                 name=f"rt-entry-mark-{symbol}",
             )
 
-        # 基准武装后才做 TP1/SL1/SL2
-        if pos.is_flat or not pos.baseline_armed:
+        # 基准武装后做移动止盈；等待期也检查 SL2
+        if pos.is_flat:
+            return
+        if not pos.baseline_armed and not pos.pending_baseline:
             return
         if symbol in self._mark_exit_busy:
             return
@@ -1213,7 +1227,9 @@ class StrategyEngine:
                 if not self._trading_ready():
                     return
                 pos = self.positions.get(symbol)
-                if not pos or pos.is_flat or not pos.baseline_armed:
+                if not pos or pos.is_flat:
+                    return
+                if not pos.baseline_armed and not pos.pending_baseline:
                     return
                 action = StrategyRules.check_price_exits(self.cfg_strategy, pos, mark)
                 if action is None or action.type == "NONE":
@@ -1489,10 +1505,13 @@ class StrategyEngine:
 
     async def _record_trade(self, symbol, side, position_side, event, qty, price,
                             margin, coid, raw, realized_pnl: float = 0.0):
+        # 成交展示用真实下单时刻；K 线收盘时刻仅作元数据，避免全部显示成整点
+        now_cn = datetime.now(TZ_CN)
         bar_ts = self._bar_close_ts.get(symbol)
         raw_out = dict(raw or {})
         if bar_ts is not None:
             raw_out["kline_close_ts"] = bar_ts.isoformat(timespec="seconds")
+        raw_out["wall_ts"] = now_cn.isoformat(timespec="seconds")
         async with AsyncSessionLocal() as db:
             db.add(Trade(
                 symbol=symbol, side=side, position_side=position_side, event=event,
@@ -1504,9 +1523,8 @@ class StrategyEngine:
             "type": "trade", "symbol": symbol, "event": event, "side": side,
             "position_side": position_side, "quantity": qty, "price": price,
             "margin": margin, "realized_pnl": realized_pnl,
+            "ts": now_cn.isoformat(timespec="seconds"),
         }
-        if bar_ts is not None:
-            payload["ts"] = bar_ts.isoformat(timespec="seconds")
         self.bus.publish(payload)
 
     async def _log(self, level: str, symbol: str, message: str, event: str = "engine"):

@@ -73,13 +73,17 @@ def _check_side_signal(
 
 def _tf_metrics(ind: SymbolIndicators, timeframe: str, lookback: int):
     """
-    指标口径：
-    - RSI：始终用已收盘 Wilder 值
+    指标口径（实时开仓）：
+    - RSI：有 live 未收盘价时用 peek 估算；否则用已收盘 Wilder 值
     - VOL：有 live 未收盘量时用 live vs 最近 N 根已收盘均量；
            否则用最新已收盘量 vs 其前 N 根均量（avg_prior）
     """
     t = ind.get(timeframe)
     rsi = t.rsi.value if t.rsi.initialized else None
+    if t.live_close is not None and t.rsi.initialized:
+        peeked = t.rsi.peek(t.live_close)
+        if peeked is not None:
+            rsi = peeked
     if t.live_volume is not None:
         vol_latest = t.live_volume
         vol_avg = t.volume.avg_closed(lookback)
@@ -172,12 +176,33 @@ class StrategyRules:
     @classmethod
     def check_price_exits(cls, params: StrategyParams, pos: SymbolPosition,
                           mark: float) -> Optional[Action]:
-        """基准武装后的实时退出：先到先返回（调用方单币锁）。"""
-        if pos.is_flat or not pos.baseline_armed or mark <= 0:
+        """
+        实时退出：
+        - 等待基准期：仅 SL2（防等 1m 期间大幅亏损）
+        - 武装后：峰值移动止盈 TP1 + SL1 保本 + SL2
+        """
+        if pos.is_flat or mark <= 0:
             return None
         ex = params.exit
         pnl = pos.unrealized_pnl(mark)
-        p0 = pos.baseline_pnl
+
+        # 等待 1m 武装期间：只跑硬止损 SL2
+        if not pos.baseline_armed:
+            if pos.pending_baseline and ex.enable_sl2 and pos.margin > 0:
+                loss_limit = pos.margin * (ex.sl2_margin_loss_pct / 100.0)
+                if pnl <= -loss_limit:
+                    return Action(
+                        type="CLOSE_SL2",
+                        reason=(
+                            f"SL2 浮亏(等基准): {pnl:.4f} ≤ -保证金×"
+                            f"{ex.sl2_margin_loss_pct:g}% (-{loss_limit:.4f})"
+                        ),
+                    )
+            return None
+
+        # 先上移峰值，再判定回撤（移动止盈）
+        peak = pos.ratchet_peak(mark)
+        pnl = pos.unrealized_pnl(mark)
 
         # SL2：浮亏 ≥ 保证金比例
         if ex.enable_sl2 and pos.margin > 0:
@@ -191,23 +216,23 @@ class StrategyRules:
                     ),
                 )
 
-        # TP1：固定基准利润回撤
-        if ex.enable_tp1 and p0 > 0:
-            floor = p0 * (1.0 - ex.tp1_drawdown_pct / 100.0)
+        # TP1：相对峰值浮盈回撤（真正移动止盈）
+        if ex.enable_tp1 and peak > 0:
+            floor = peak * (1.0 - ex.tp1_drawdown_pct / 100.0)
             if pnl <= floor:
                 return Action(
                     type="CLOSE_TP1",
                     reason=(
-                        f"TP1 利润回撤: P0={p0:.4f} → {pnl:.4f} "
-                        f"≤ P0×(1-{ex.tp1_drawdown_pct:g}%)={floor:.4f}"
+                        f"TP1 移动止盈: 峰值={peak:.4f} → {pnl:.4f} "
+                        f"≤ 峰值×(1-{ex.tp1_drawdown_pct:g}%)={floor:.4f}"
                     ),
                 )
 
-        # SL1：保本（曾有正基准利润时，浮盈降至 ≤0）
-        if ex.enable_sl1 and p0 > 0 and pnl <= 0:
+        # SL1：曾见正峰值后，浮盈降至 ≤0 保本
+        if ex.enable_sl1 and peak > 0 and pnl <= 0:
             return Action(
                 type="CLOSE_SL1",
-                reason=f"SL1 保本: P0={p0:.4f} → 浮盈={pnl:.4f}≤0",
+                reason=f"SL1 保本: 峰值={peak:.4f} → 浮盈={pnl:.4f}≤0",
             )
 
         return None

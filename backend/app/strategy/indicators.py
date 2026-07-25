@@ -53,6 +53,20 @@ class RSIState:
         rs = self._avg_gain / self._avg_loss
         return 100.0 - 100.0 / (1.0 + rs)
 
+    def peek(self, live_close: float) -> Optional[float]:
+        """用未收盘价估算当前 RSI，不改写内部状态（供实时开仓）。"""
+        if not self.initialized or self._prev_close is None:
+            return self.value
+        delta = live_close - self._prev_close
+        gain = max(delta, 0.0)
+        loss = max(-delta, 0.0)
+        avg_gain = (self._avg_gain * (self.period - 1) + gain) / self.period
+        avg_loss = (self._avg_loss * (self.period - 1) + loss) / self.period
+        if avg_loss == 0:
+            return 100.0
+        rs = avg_gain / avg_loss
+        return 100.0 - 100.0 / (1.0 + rs)
+
 
 @dataclass
 class VolumeWindow:
@@ -153,6 +167,10 @@ class TimeframeIndicators:
 
     def snapshot(self, latest_price: Optional[float] = None) -> dict:
         rsi = self.rsi.value
+        if self.live_close is not None and self.rsi.initialized:
+            peeked = self.rsi.peek(self.live_close)
+            if peeked is not None:
+                rsi = peeked
         if self.live_volume is not None:
             vol_latest = self.live_volume
             vol_avg = self.volume.avg_closed()
@@ -173,7 +191,7 @@ class TimeframeIndicators:
             "last_close": self.last_close,
             "last_open": self.last_open,
             "bar_count": self.bar_count,
-            "live": self.live_volume is not None,
+            "live": self.live_volume is not None or self.live_close is not None,
         }
 
 
