@@ -132,19 +132,28 @@ def test_sl1_breakeven():
     assert act is not None and act.type == "CLOSE_SL1"
 
 
-def test_sl2_margin_loss():
+def test_sl2_uses_actual_margin_not_budget():
+    """SL2 按真实保证金；若误用偏大预算会拖到很高 ROI 才停。"""
     params = StrategyParams()
     params.exit.enable_tp1 = False
     params.exit.enable_sl1 = False
     params.exit.enable_sl2 = True
     params.exit.sl2_margin_loss_pct = 10
-    pos = SymbolPosition(symbol="T")
-    pos.open("LONG", 1, 100, 100)
-    pos.arm_baseline(100, 1)  # peak=0
-    act = StrategyRules.check_price_exits(params, pos, 91)  # pnl=-9
+    # 模拟 EDU：qty=259 entry=0.03472 lev=20 → 真实保证金≈0.45
+    qty, entry, lev = 259.0, 0.03472, 20
+    real_margin = qty * entry / lev
+    pos = SymbolPosition(symbol="EDUUSDT")
+    pos.open("SHORT", qty, entry, real_margin)
+    pos.arm_baseline(entry, 1)
+    # 10% 真实保证金 ≈ 0.045；价格涨到使浮亏刚好超限
+    # 空单浮亏 = (mark-entry)*qty = real_margin*0.1
+    mark_limit = entry + (real_margin * 0.10) / qty
+    act = StrategyRules.check_price_exits(params, pos, mark_limit - 1e-9)
     assert act is None
-    act = StrategyRules.check_price_exits(params, pos, 90)  # pnl=-10
+    act = StrategyRules.check_price_exits(params, pos, mark_limit + 1e-9)
     assert act is not None and act.type == "CLOSE_SL2"
+    # 此时相对真实保证金约 10%，绝不应等到 0.03545（约 -44% ROI）才触发
+    assert mark_limit < 0.0350
 
 
 def test_sl2_works_while_pending_baseline():

@@ -960,11 +960,22 @@ class StrategyEngine:
                         "WARN", sym,
                         f"[{tag}] 方向不一致，已按交易所重接管为 {direction}",
                     )
-                elif abs(pos.quantity - qty) > 1e-8 or abs(pos.entry_price - entry) > 1e-10:
-                    pos.quantity = qty
-                    pos.entry_price = entry
-                    pos.margin = margin
-                    await self._persist_position(sym)
+                else:
+                    changed = False
+                    if abs(pos.quantity - qty) > 1e-8 or abs(pos.entry_price - entry) > 1e-10:
+                        pos.quantity = qty
+                        pos.entry_price = entry
+                        changed = True
+                    # 校正保证金：旧逻辑可能存了「资金×仓位%」预算，导致 SL2 过晚
+                    if margin > 0 and abs(pos.margin - margin) > max(1e-6, margin * 0.02):
+                        await self._log(
+                            "INFO", sym,
+                            f"[{tag}] 校正保证金 {pos.margin:.4f} → {margin:.4f}（按名义/杠杆）",
+                        )
+                        pos.margin = margin
+                        changed = True
+                    if changed:
+                        await self._persist_position(sym)
 
         # 内存有仓但交易所已平 → CLOSE_EXTERNAL
         for sym in list(self.symbols):
@@ -1407,14 +1418,28 @@ class StrategyEngine:
             quantity=qty, client_order_id=coid,
         )
         fill_price = float(order.get("avgPrice") or mark)
-        pos.open(direction, qty, fill_price, margin)  # pending_baseline=True
+        if fill_price <= 0:
+            fill_price = mark
+        try:
+            fill_qty = float(order.get("executedQty") or order.get("quantity") or qty)
+        except Exception:
+            fill_qty = qty
+        if fill_qty <= 0:
+            fill_qty = qty
+        # SL2 必须用真实占用保证金 = 名义/杠杆，不能用「资金×仓位%」预算值
+        # （否则杠杆跟随时预算偏大，10% 止损会拖到交易所 ROI 远超 10% 才触发）
+        actual_margin = await self._margin_for_qty(symbol, fill_qty, fill_price)
+        if actual_margin <= 0:
+            actual_margin = margin
+        pos.open(direction, fill_qty, fill_price, actual_margin)  # pending_baseline=True
         await self._persist_position(symbol)
         await self._record_trade(
-            symbol, side, direction, "OPEN", qty, fill_price, margin, coid, order,
+            symbol, side, direction, "OPEN", fill_qty, fill_price, actual_margin, coid, order,
         )
         await self._log(
             "INFO", symbol,
-            f"[开仓 {direction}] qty={qty} @ {fill_price:.4f} margin≈{margin:.4f} | {reason}",
+            f"[开仓 {direction}] qty={fill_qty} @ {fill_price:.6f} "
+            f"margin≈{actual_margin:.4f}(预算{margin:.4f}) | {reason}",
         )
 
     async def _do_add(self, symbol: str, reason: str, trigger_key: str):
@@ -1449,14 +1474,26 @@ class StrategyEngine:
             quantity=qty, client_order_id=coid,
         )
         fill_price = float(order.get("avgPrice") or mark)
-        pos.add(qty, fill_price, margin, trigger_key)  # pending_baseline reset
+        if fill_price <= 0:
+            fill_price = mark
+        try:
+            fill_qty = float(order.get("executedQty") or order.get("quantity") or qty)
+        except Exception:
+            fill_qty = qty
+        if fill_qty <= 0:
+            fill_qty = qty
+        actual_margin = await self._margin_for_qty(symbol, fill_qty, fill_price)
+        if actual_margin <= 0:
+            actual_margin = margin
+        pos.add(fill_qty, fill_price, actual_margin, trigger_key)  # pending_baseline reset
         await self._persist_position(symbol)
         await self._record_trade(
-            symbol, side, pos.direction, "ADD", qty, fill_price, margin, coid, order,
+            symbol, side, pos.direction, "ADD", fill_qty, fill_price, actual_margin, coid, order,
         )
         await self._log(
             "INFO", symbol,
-            f"[加仓{pos.add_count}] qty={qty} @ {fill_price:.4f} | {reason}",
+            f"[加仓{pos.add_count}] qty={fill_qty} @ {fill_price:.6f} "
+            f"margin≈{actual_margin:.4f} | {reason}",
         )
 
     async def _do_close(self, symbol: str, event: str, reason: str):
