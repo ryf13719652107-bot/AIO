@@ -1303,6 +1303,17 @@ class StrategyEngine:
         if action.type == "NONE":
             return
         if action.type == "ADD" and not self.allow_increase_for(symbol):
+            pos = self.positions.get(symbol)
+            why = []
+            cfg = self.cfg_symbols.get(symbol)
+            if cfg is not None and not cfg.enabled:
+                why.append("币种已禁开仓")
+            if pos is not None and pos.add_blocked:
+                why.append("接管仓禁补仓(add_blocked)")
+            await self._log(
+                "WARN", symbol,
+                f"加仓信号已触发但被拦截: {action.reason} | {';'.join(why) or 'allow_increase=false'}",
+            )
             return
         if not self._trading_ready() or epoch != self._run_epoch:
             return
@@ -1317,12 +1328,38 @@ class StrategyEngine:
         t = action.type
         if t == "OPEN_LONG":
             await self._do_open(symbol, "LONG", action.reason)
+            # 同刻若已满足更严的加仓条件（如 VOL 已达 10x 且 RSI 更深），立即补仓
+            await self._try_immediate_add(symbol)
         elif t == "OPEN_SHORT":
             await self._do_open(symbol, "SHORT", action.reason)
+            await self._try_immediate_add(symbol)
         elif t == "ADD":
             await self._do_add(symbol, action.reason, action.trigger_key)
         elif t in ("CLOSE_TP1", "CLOSE_TP2", "CLOSE_SL1", "CLOSE_SL2"):
             await self._do_close(symbol, event=t, reason=action.reason)
+
+    async def _try_immediate_add(self, symbol: str):
+        """开仓成功后立刻再评估一级加仓，避免同根极端行情错过。"""
+        if not self._trading_ready():
+            return
+        if not self.allow_increase_for(symbol):
+            return
+        pos = self.positions.get(symbol)
+        ind = self.indicators.get(symbol)
+        if not pos or pos.is_flat or not ind:
+            return
+        action = StrategyRules.evaluate_entry(
+            self.cfg_strategy, ind, pos, allow_open=False,
+        )
+        if action.type != "ADD":
+            return
+        if not self.allow_increase_for(symbol):
+            return
+        try:
+            await self._do_add(symbol, action.reason, action.trigger_key)
+        except Exception as e:
+            logger.exception("开仓后立即加仓失败 %s: %s", symbol, e)
+            await self._log("ERROR", symbol, f"开仓后立即加仓失败: {e}")
 
     async def _capital_available(self) -> float:
         """可用于新开/加仓的保证金（已占用仓位保证金需扣除）。"""
@@ -1336,6 +1373,18 @@ class StrategyEngine:
             except Exception as e:
                 logger.warning("拉账户余额失败: %s", e)
         return max(0.0, self.cfg_global.capital_usdt - used)
+
+    async def _order_margin_budget(self, symbol: str, *, for_add: bool = False) -> float:
+        """下单保证金预算：资金×仓位%；加仓时若过小则回退到与当前仓同额。"""
+        remaining = await self._capital_available()
+        pct = max(0.0, float(self.cfg_strategy.position_pct)) / 100.0
+        budget = max(0.0, remaining) * pct
+        if for_add:
+            pos = self.positions.get(symbol)
+            if pos is not None and not pos.is_flat and pos.margin > 0:
+                if budget < pos.margin * 0.5 or budget <= 0:
+                    return float(pos.margin)
+        return budget
 
     async def query_account_balance(self) -> dict:
         await self.load_exchange_settings()
@@ -1389,15 +1438,14 @@ class StrategyEngine:
         pos = self.positions[symbol]
         if not pos.is_flat:
             return
-        remaining = await self._capital_available()
-        margin = max(0.0, remaining) * (self.cfg_strategy.position_pct / 100.0)
+        margin = await self._order_margin_budget(symbol, for_add=False)
         qty, mark = await self._calc_order_qty(symbol, margin)
 
         if qty < self.exchange.min_qty(symbol):
             await self._log(
                 "WARN", symbol,
                 f"开仓跳过: 数量 {qty} < 最小 {self.exchange.min_qty(symbol)} "
-                f"(可用保证金≈{remaining:.2f}, 本单保证金≈{margin:.4f})",
+                f"(本单保证金≈{margin:.4f})",
             )
             return
         if qty * mark < self.exchange.min_notional(symbol):
@@ -1405,7 +1453,7 @@ class StrategyEngine:
                 "WARN", symbol,
                 f"开仓跳过: 名义≈{qty * mark:.2f} < 最小 "
                 f"{self.exchange.min_notional(symbol):.2f} "
-                f"(可用保证金≈{remaining:.2f}, 本单保证金≈{margin:.4f})",
+                f"(本单保证金≈{margin:.4f})",
             )
             return
 
@@ -1427,7 +1475,6 @@ class StrategyEngine:
         if fill_qty <= 0:
             fill_qty = qty
         # SL2 必须用真实占用保证金 = 名义/杠杆，不能用「资金×仓位%」预算值
-        # （否则杠杆跟随时预算偏大，10% 止损会拖到交易所 ROI 远超 10% 才触发）
         actual_margin = await self._margin_for_qty(symbol, fill_qty, fill_price)
         if actual_margin <= 0:
             actual_margin = margin
@@ -1447,22 +1494,39 @@ class StrategyEngine:
             return
         pos = self.positions[symbol]
         if pos.is_flat or pos.add_blocked or pos.add_count >= 2:
+            await self._log(
+                "WARN", symbol,
+                f"加仓跳过: flat={pos.is_flat} blocked={pos.add_blocked} "
+                f"add_count={pos.add_count} | {reason}",
+            )
             return
-        remaining = await self._capital_available()
-        margin = max(0.0, remaining) * (self.cfg_strategy.position_pct / 100.0)
+        margin = await self._order_margin_budget(symbol, for_add=True)
         qty, mark = await self._calc_order_qty(symbol, margin)
+        # 预算过小达不到最小名义时，强制按当前仓保证金再试一次
+        if (
+            (qty < self.exchange.min_qty(symbol) or qty * mark < self.exchange.min_notional(symbol))
+            and pos.margin > 0
+            and abs(margin - pos.margin) > 1e-8
+        ):
+            await self._log(
+                "INFO", symbol,
+                f"加仓预算过小(保证金≈{margin:.4f})，改用与现仓同额 {pos.margin:.4f}",
+            )
+            margin = float(pos.margin)
+            qty, mark = await self._calc_order_qty(symbol, margin)
         if qty < self.exchange.min_qty(symbol):
             await self._log(
                 "WARN", symbol,
                 f"加仓跳过: 数量 {qty} < 最小 {self.exchange.min_qty(symbol)} "
-                f"(可用≈{remaining:.2f}, 本单保证金≈{margin:.4f})",
+                f"(本单保证金≈{margin:.4f}) | {reason}",
             )
             return
         if qty * mark < self.exchange.min_notional(symbol):
             await self._log(
                 "WARN", symbol,
                 f"加仓跳过: 名义≈{qty * mark:.2f} < 最小 "
-                f"{self.exchange.min_notional(symbol):.2f}",
+                f"{self.exchange.min_notional(symbol):.2f} "
+                f"(本单保证金≈{margin:.4f}) | {reason}",
             )
             return
         if not self._trading_ready():

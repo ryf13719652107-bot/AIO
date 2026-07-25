@@ -67,7 +67,6 @@ def test_add_levels_order():
     ind = _ready_ind(final_vol=100.0)
     pos = SymbolPosition(symbol="T")
     pos.open("LONG", 1, 100, 10)
-    # 先武装以免干扰；加仓判定不依赖基准
     ok1, _ = StrategyRules.add_level_ready(params, ind, pos, 1)
     assert ok1
     ok2, _ = StrategyRules.add_level_ready(params, ind, pos, 2)
@@ -75,6 +74,28 @@ def test_add_levels_order():
     pos.add(1, 110, 10, "add1")
     ok2, _ = StrategyRules.add_level_ready(params, ind, pos, 2)
     assert ok2
+
+
+def test_evaluate_entry_returns_add_when_holding():
+    params = StrategyParams()
+    params.timeframe = "1m"
+    params.entry_conditions.long.vol_lookback = 5
+    params.add_conditions.enabled = True
+    params.add_conditions.level1.long.vol_lookback = 5
+    params.add_conditions.level1.long.vol_mult = 10
+    params.add_conditions.level1.long.rsi_threshold = 100
+    params.add_conditions.level1.short.enable_rsi = False
+    params.add_conditions.level1.short.enable_vol = False
+    ind = _ready_ind(final_vol=10.0)  # 收盘不够 10x
+    pos = SymbolPosition(symbol="T")
+    pos.open("LONG", 1, 100, 10)
+    act = StrategyRules.evaluate_entry(params, ind, pos)
+    assert act.type == "NONE"
+    avg = ind.get("1m").volume.avg_closed(5)
+    ind.set_live("1m", volume=avg * 10.5, close=90)
+    act = StrategyRules.evaluate_entry(params, ind, pos)
+    assert act.type == "ADD"
+    assert act.trigger_key == "add1"
 
 
 def test_tp1_drawdown_20_to_14():
