@@ -18,7 +18,7 @@
             </el-select>
           </div>
           <div class="field">
-            <label>仓位比例 %（剩余保证金）</label>
+            <label>仓位比例 %（每笔按本金，开+加仓1+加仓2≈3倍）</label>
             <el-input-number v-model="params.position_pct" :min="0.1" :max="100" :precision="1" :step="0.5" size="small" controls-position="right" />
           </div>
           <div class="field">
@@ -111,7 +111,7 @@
       </section>
 
       <section class="block">
-        <div class="block-title">加仓（两级顺序 · 各最多一次 · 每级用剩余保证金%）</div>
+        <div class="block-title">加仓（两级顺序 · 各最多一次 · 每级与开仓同为本金×仓位%）</div>
         <div class="tp-row">
           <el-checkbox v-model="params.add_conditions.enabled"><b>启用加仓</b></el-checkbox>
         </div>

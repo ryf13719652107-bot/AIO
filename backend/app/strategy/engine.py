@@ -1362,7 +1362,7 @@ class StrategyEngine:
             await self._log("ERROR", symbol, f"开仓后立即加仓失败: {e}")
 
     async def _capital_available(self) -> float:
-        """可用于新开/加仓的保证金（已占用仓位保证金需扣除）。"""
+        """当前可开新单的可用保证金（交易所可用 / 本金扣除已占用）。"""
         used = sum(p.margin for p in self.positions.values() if not p.is_flat)
         if self.cfg_global.capital_source == "account" and self.exchange and self.exchange_api_key:
             try:
@@ -1374,18 +1374,38 @@ class StrategyEngine:
                 logger.warning("拉账户余额失败: %s", e)
         return max(0.0, self.cfg_global.capital_usdt - used)
 
+    async def _sizing_capital_base(self) -> float:
+        """
+        仓位比例的计算基数（本金/权益），不因本策略已开仓而缩小。
+        开仓+加仓1+加仓2 各 2% → 合计约 6% 本金。
+        """
+        used = sum(p.margin for p in self.positions.values() if not p.is_flat)
+        if self.cfg_global.capital_source == "account" and self.exchange and self.exchange_api_key:
+            try:
+                avail = float(await self.exchange.get_account_balance())
+                # 权益近似 = 可用 + 本策略已占用保证金
+                return max(0.0, avail + used)
+            except Exception as e:
+                logger.warning("拉账户余额失败: %s", e)
+        return max(0.0, float(self.cfg_global.capital_usdt or 0))
+
     async def _order_margin_budget(self, symbol: str, *, for_add: bool = False) -> float:
-        """下单保证金预算：资金×仓位%；加仓时若过小则回退到与当前仓同额。"""
-        remaining = await self._capital_available()
+        """每笔开/加仓保证金 = 本金基数 × 仓位%；再与当前可用取小，避免超额下单。"""
+        base = await self._sizing_capital_base()
         pct = max(0.0, float(self.cfg_strategy.position_pct)) / 100.0
-        budget = max(0.0, remaining) * pct
+        budget = max(0.0, base) * pct
+        avail = await self._capital_available()
+        if avail > 0:
+            budget = min(budget, avail)
+        # 加仓时若可用被挤占导致过小，回退到与首仓单笔同额（累计保证金/已开档位数）
         if for_add:
             pos = self.positions.get(symbol)
             if pos is not None and not pos.is_flat and pos.margin > 0:
-                if budget < pos.margin * 0.5 or budget <= 0:
-                    return float(pos.margin)
-        return budget
-
+                legs = max(1, int(pos.add_count) + 1)
+                unit = float(pos.margin) / legs
+                if budget < unit * 0.8:
+                    budget = min(unit, avail) if avail > 0 else unit
+        return max(0.0, budget)
     async def query_account_balance(self) -> dict:
         await self.load_exchange_settings()
         if not self.exchange_api_key or not self.exchange_api_secret:

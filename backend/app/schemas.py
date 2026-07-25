@@ -149,7 +149,7 @@ class StrategyParams(BaseModel):
 
     strategy_version: int = 2
     timeframe: Literal["1m", "3m", "5m"] = "1m"
-    position_pct: float = 2.0               # 首仓/加仓：剩余保证金 %
+    position_pct: float = 2.0               # 每笔开/加仓：本金×该比例；满三级约 3×
     rsi_period: int = 6
 
     # 杠杆：follow=跟随交易所；manual=手动设置
