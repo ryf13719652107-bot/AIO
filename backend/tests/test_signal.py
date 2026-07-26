@@ -98,59 +98,36 @@ def test_evaluate_entry_returns_add_when_holding():
     assert act.trigger_key == "add1"
 
 
-def test_tp1_drawdown_20_to_14():
+def test_tp1_margin_profit_50pct():
+    """TP1：浮盈达到保证金 50% 止盈。"""
     params = StrategyParams()
     params.exit.enable_tp1 = True
-    params.exit.tp1_drawdown_pct = 30
+    params.exit.tp1_profit_pct = 50
     params.exit.enable_sl1 = False
     params.exit.enable_sl2 = False
     pos = SymbolPosition(symbol="T")
-    pos.open("LONG", 1, 100, 100)  # margin 100
-    pos.arm_baseline(120, 1)  # peak = 20
-    assert abs(pos.peak_pnl - 20) < 1e-9
-    # 浮盈 15 > 14 → 不触发
-    act = StrategyRules.check_price_exits(params, pos, 115)
+    pos.open("LONG", 1, 100, 100)  # margin 100 → 目标浮盈 50
+    pos.arm_baseline(100, 1)
+    # 浮盈 49 → 不触发
+    act = StrategyRules.check_price_exits(params, pos, 149)
     assert act is None
-    # 浮盈 14 → 触发
-    act = StrategyRules.check_price_exits(params, pos, 114)
-    assert act is not None and act.type == "CLOSE_TP1"
-
-
-def test_tp1_trails_peak_not_fixed_baseline():
-    """浮盈创新高后，回撤按峰值而非开仓时固定 P0。"""
-    params = StrategyParams()
-    params.exit.enable_tp1 = True
-    params.exit.tp1_drawdown_pct = 30
-    params.exit.enable_sl1 = False
-    params.exit.enable_sl2 = False
-    pos = SymbolPosition(symbol="T")
-    pos.open("LONG", 1, 100, 100)
-    pos.arm_baseline(110, 1)  # 初始峰值 10，旧逻辑地板=7
-    # 冲到 150 → 峰值 50，地板应为 35
+    # 浮盈 50 → 触发
     act = StrategyRules.check_price_exits(params, pos, 150)
-    assert act is None
-    assert abs(pos.peak_pnl - 50) < 1e-9
-    # 回撤到 40（>35）不触发；若仍用旧固定 P0=10 则会误触（40>7 其实也不会）
-    # 关键场景：回撤到 34 ≤ 35 → 必须触发；旧固定地板 7 也会触发，但峰值语义不同
-    act = StrategyRules.check_price_exits(params, pos, 140)  # pnl=40
-    assert act is None
-    act = StrategyRules.check_price_exits(params, pos, 134)  # pnl=34 ≤ 35
     assert act is not None and act.type == "CLOSE_TP1"
-    assert "峰值=" in act.reason
+    assert "回报率" in act.reason or "50" in act.reason
 
 
-def test_sl1_breakeven():
+def test_sl1_disabled_no_breakeven():
+    """不再做保本止盈。"""
     params = StrategyParams()
     params.exit.enable_tp1 = False
-    params.exit.enable_sl1 = True
+    params.exit.enable_sl1 = True  # 即使旧配置打开也不再生效
     params.exit.enable_sl2 = False
     pos = SymbolPosition(symbol="T")
     pos.open("LONG", 1, 100, 100)
-    pos.arm_baseline(110, 1)  # peak=10
-    act = StrategyRules.check_price_exits(params, pos, 101)
-    assert act is None
+    pos.arm_baseline(110, 1)
     act = StrategyRules.check_price_exits(params, pos, 100)
-    assert act is not None and act.type == "CLOSE_SL1"
+    assert act is None
 
 
 def test_sl2_uses_actual_margin_not_budget():
@@ -193,34 +170,14 @@ def test_sl2_works_while_pending_baseline():
 def test_no_tp1_before_baseline():
     params = StrategyParams()
     params.exit.enable_tp1 = True
+    params.exit.tp1_profit_pct = 50
     params.exit.enable_sl2 = False
     pos = SymbolPosition(symbol="T")
     pos.open("LONG", 1, 100, 100)
     assert pos.baseline_armed is False
-    # 有浮盈回撤也不 TP1（尚未武装）
-    act = StrategyRules.check_price_exits(params, pos, 120)
+    # 未武装前即使大盈也不 TP1
+    act = StrategyRules.check_price_exits(params, pos, 200)
     assert act is None
-    act = StrategyRules.check_price_exits(params, pos, 110)
-    assert act is None
-
-
-def test_arm_negative_then_trail_when_profit_appears():
-    """1m 收盘时已亏：峰值从 0 起，后续浮盈出现后仍可移动止盈。"""
-    params = StrategyParams()
-    params.exit.enable_tp1 = True
-    params.exit.tp1_drawdown_pct = 30
-    params.exit.enable_sl1 = False
-    params.exit.enable_sl2 = False
-    pos = SymbolPosition(symbol="T")
-    pos.open("LONG", 1, 100, 100)
-    pos.arm_baseline(95, 1)  # 当时浮盈 -5，峰值 0
-    assert pos.peak_pnl == 0
-    assert StrategyRules.check_price_exits(params, pos, 95) is None
-    # 转盈到 130 → 峰值 30，地板 21
-    assert StrategyRules.check_price_exits(params, pos, 130) is None
-    assert abs(pos.peak_pnl - 30) < 1e-9
-    act = StrategyRules.check_price_exits(params, pos, 120)  # 20 ≤ 21
-    assert act is not None and act.type == "CLOSE_TP1"
 
 
 def test_tp2_long_rsi():

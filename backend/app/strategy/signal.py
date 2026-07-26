@@ -4,7 +4,8 @@ RSI + 成交量策略规则判定器。
 开仓/加仓：实时（未收盘 live VOL + 已收盘 RSI）；已启用条件 AND。
 加仓：两级严格顺序，各最多一次。
 TP2：所选周期收盘 RSI。
-TP1/SL1/SL2：1m 收盘武装基准后按实时 mark 判定。
+TP1/SL2：1m 收盘武装基准后按实时 mark 判定。
+TP1：浮盈≥保证金×目标比例（默认50%）；已取消保本与移动止盈。
 """
 
 from dataclasses import dataclass
@@ -178,8 +179,8 @@ class StrategyRules:
                           mark: float) -> Optional[Action]:
         """
         实时退出：
-        - 等待基准期：仅 SL2（防等 1m 期间大幅亏损）
-        - 武装后：峰值移动止盈 TP1 + SL1 保本 + SL2
+        - 等待基准期：仅 SL2
+        - 武装后：TP1 保证金盈利目标 + SL2（不再保本/移动止盈）
         """
         if pos.is_flat or mark <= 0:
             return None
@@ -200,10 +201,6 @@ class StrategyRules:
                     )
             return None
 
-        # 先上移峰值，再判定回撤（移动止盈）
-        peak = pos.ratchet_peak(mark)
-        pnl = pos.unrealized_pnl(mark)
-
         # SL2：浮亏 ≥ 保证金比例
         if ex.enable_sl2 and pos.margin > 0:
             loss_limit = pos.margin * (ex.sl2_margin_loss_pct / 100.0)
@@ -216,24 +213,18 @@ class StrategyRules:
                     ),
                 )
 
-        # TP1：相对峰值浮盈回撤（真正移动止盈）
-        if ex.enable_tp1 and peak > 0:
-            floor = peak * (1.0 - ex.tp1_drawdown_pct / 100.0)
-            if pnl <= floor:
+        # TP1：回报率（浮盈/保证金）达到目标（默认 50%，同币安仓位回报率）
+        if ex.enable_tp1 and pos.margin > 0:
+            target = pos.margin * (ex.tp1_profit_pct / 100.0)
+            if pnl >= target:
+                roe_pct = (pnl / pos.margin) * 100.0
                 return Action(
                     type="CLOSE_TP1",
                     reason=(
-                        f"TP1 移动止盈: 峰值={peak:.4f} → {pnl:.4f} "
-                        f"≤ 峰值×(1-{ex.tp1_drawdown_pct:g}%)={floor:.4f}"
+                        f"TP1 止盈: 回报率={roe_pct:.2f}% ≥ {ex.tp1_profit_pct:g}% "
+                        f"(浮盈={pnl:.4f}, 保证金={pos.margin:.4f})"
                     ),
                 )
-
-        # SL1：曾见正峰值后，浮盈降至 ≤0 保本
-        if ex.enable_sl1 and peak > 0 and pnl <= 0:
-            return Action(
-                type="CLOSE_SL1",
-                reason=f"SL1 保本: 峰值={peak:.4f} → 浮盈={pnl:.4f}≤0",
-            )
 
         return None
 

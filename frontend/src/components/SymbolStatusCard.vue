@@ -21,7 +21,6 @@
           <span v-if="runtime?.mark_price">mark <b>{{ fmt(runtime.mark_price, 4) }}</b></span>
           <span v-if="runtime?.entry_price && runtime?.direction !== 'FLAT'">entry <b>{{ fmt(runtime.entry_price, 4) }}</b></span>
           <span v-if="runtime?.baseline_price">基准价 <b>{{ fmt(runtime.baseline_price, 4) }}</b></span>
-          <span v-if="runtime?.baseline_armed && runtime?.peak_pnl != null">峰值浮盈 <b>{{ fmt(runtime.peak_pnl, 2) }}</b></span>
           <span :class="pnlClass">{{ formatPnl(runtime?.unrealized_pnl) }}</span>
         </div>
       </div>

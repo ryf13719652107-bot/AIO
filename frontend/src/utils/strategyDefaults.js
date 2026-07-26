@@ -75,11 +75,11 @@ export function defaultStrategyParams() {
     },
     exit: {
       enable_tp1: true,
-      tp1_drawdown_pct: 30,
+      tp1_profit_pct: 50,
       enable_tp2: true,
       tp2_long_rsi: 85,
       tp2_short_rsi: 15,
-      enable_sl1: true,
+      enable_sl1: false,
       enable_sl2: true,
       sl2_margin_loss_pct: 10,
     },
@@ -121,12 +121,18 @@ export function mergeStrategyParams(raw) {
     merged.strategy_version = 2
     return merged
   }
+  const exit = deepMerge(d.exit, raw.exit || {})
+  if (exit.tp1_profit_pct == null || Number(exit.tp1_profit_pct) <= 0) {
+    exit.tp1_profit_pct = 50
+  }
+  exit.enable_sl1 = false
+  delete exit.tp1_drawdown_pct
   return {
     ...deepMerge(d, raw),
     screening: deepMerge(d.screening, raw.screening || {}),
     entry_conditions: deepMerge(d.entry_conditions, raw.entry_conditions || {}),
     add_conditions: deepMerge(d.add_conditions, raw.add_conditions || {}),
-    exit: deepMerge(d.exit, raw.exit || {}),
+    exit,
     strategy_version: 2,
   }
 }

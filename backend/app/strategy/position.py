@@ -1,8 +1,8 @@
 """
 单币种仓位状态机。
 - 首仓 + 两级顺序加仓（各最多一次）
-- 开/加仓后等待下一根 1m K 收盘开始移动止盈
-- 武装后按峰值浮盈 peak_pnl 回撤（真正移动止盈）；SL2 等待期也生效
+- 开/加仓后等待下一根 1m K 收盘武装退出基准（TP1/SL2）
+- SL2 在等待武装期间同样生效
 """
 
 import time
@@ -35,7 +35,7 @@ class SymbolPosition:
     baseline_price: float = 0.0         # 武装时参考价（1m 收盘价）
     baseline_pnl: float = 0.0           # 武装时浮盈（可≤0）；展示用
     baseline_open_ms: int = 0           # 武装所用 1m K 的 open_ms
-    peak_pnl: float = 0.0               # 武装后见到的最高浮盈（移动止盈峰值）
+    peak_pnl: float = 0.0               # 兼容字段（展示/持久化；退出逻辑不再使用）
 
     @property
     def is_flat(self) -> bool:
@@ -138,7 +138,7 @@ class SymbolPosition:
 
     def arm_baseline(self, ref_price: float, open_ms: int = 0,
                      *, close_boundary_ms: int = 0) -> bool:
-        """下一根 1m K 收盘后开始移动止盈：初始化峰值。"""
+        """下一根 1m K 收盘后武装退出基准。"""
         if self.is_flat or not self.pending_baseline:
             return False
         # 必须是进入等待之后的收盘，避免开仓当根立刻武装
@@ -149,7 +149,7 @@ class SymbolPosition:
         self.baseline_price = ref_price
         pnl = self.unrealized_pnl(ref_price)
         self.baseline_pnl = pnl
-        # 峰值至少从 0 起：武装时若已亏损，等后续浮盈出现再移动止盈
+        # 兼容保留 peak_pnl（退出逻辑已不再依赖）
         self.peak_pnl = max(0.0, pnl)
         self.baseline_open_ms = open_ms
         self.baseline_armed = True

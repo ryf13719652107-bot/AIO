@@ -189,6 +189,13 @@ class StrategyEngine:
         if not looks_v1 and version_i >= 2:
             clean = StrategyParams.model_validate(strategy).model_dump()
             clean["strategy_version"] = 2
+            # 止盈改为固定盈利目标；废弃保本/移动止盈字段
+            exit_cfg = dict(clean.get("exit") or {})
+            exit_cfg["enable_sl1"] = False
+            if not exit_cfg.get("tp1_profit_pct"):
+                exit_cfg["tp1_profit_pct"] = 50.0
+            exit_cfg.pop("tp1_drawdown_pct", None)
+            clean["exit"] = exit_cfg
             data["strategy"] = clean
             data.setdefault("symbols", data.get("symbols") or [])
             if "global" not in data and "global_" not in data:
@@ -1115,8 +1122,7 @@ class StrategyEngine:
             await self._persist_position(symbol)
             await self._log(
                 "INFO", symbol,
-                f"退出基准已武装(1m收盘): 峰值={pos.peak_pnl:.4f} "
-                f"(当时浮盈={pos.baseline_pnl:.4f}) @ {close_price:.6f} "
+                f"退出基准已武装(1m收盘): 开始TP1/SL2 @ {close_price:.6f} "
                 f"(open_ms={open_ms})",
             )
             self.bus.publish({"type": "runtime", "data": self.runtime_snapshot()})
@@ -1207,7 +1213,7 @@ class StrategyEngine:
                 name=f"rt-entry-mark-{symbol}",
             )
 
-        # 基准武装后做移动止盈；等待期也检查 SL2
+        # 基准武装后做 TP1/SL2；等待期也检查 SL2
         if pos.is_flat:
             return
         if not pos.baseline_armed and not pos.pending_baseline:
