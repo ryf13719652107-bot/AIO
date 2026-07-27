@@ -485,6 +485,7 @@ class StrategyEngine:
             holding_mem = [s for s, p in self.positions.items() if not p.is_flat]
             holding_ex = await self._exchange_holding_symbols()
             new_symbols = list(dict.fromkeys(holding_mem + holding_ex + screened))
+            prev_symbols = set(self.symbols)
 
             for sym in new_symbols:
                 self._ensure_symbol(sym)
@@ -498,6 +499,12 @@ class StrategyEngine:
 
             self.symbols = new_symbols
             await self._adopt_exchange_positions(tag="选币同步")
+
+            # 选币刷新后新进的币也要设杠杆（启动时只对当时列表设过一次）
+            if not initial:
+                added = [s for s in new_symbols if s not in prev_symbols]
+                if added:
+                    await self._configure_symbols_on_exchange(added)
 
             if initial:
                 await self._bootstrap_all_symbols()
@@ -809,12 +816,13 @@ class StrategyEngine:
         except Exception:
             pass
 
-    async def _configure_symbols_on_exchange(self):
+    async def _configure_symbols_on_exchange(self, symbols: Optional[list[str]] = None):
         if not self.exchange_api_key or not self.exchange_api_secret:
             logger.info("未配置 API Key，跳过杠杆/保证金模式设置")
             return
         set_lev = self.cfg_strategy.leverage_mode == "manual"
-        for sym in self.symbols:
+        targets = symbols if symbols is not None else self.symbols
+        for sym in targets:
             cfg = self.cfg_symbols.get(sym)
             if cfg and not cfg.enabled:
                 continue
@@ -825,6 +833,22 @@ class StrategyEngine:
                 )
             except Exception as e:
                 logger.error("setup %s: %s", sym, e)
+
+    async def _ensure_symbol_leverage(self, symbol: str):
+        """手动杠杆模式下，下单前再确认该币杠杆（防选币后漏设 / 启动限流失败）。"""
+        if (
+            not self.exchange
+            or not self.exchange_api_key
+            or self.cfg_strategy.leverage_mode != "manual"
+        ):
+            return
+        try:
+            await self.exchange.setup_symbol(
+                symbol, int(self.cfg_strategy.leverage), "CROSSED",
+                set_leverage=True,
+            )
+        except Exception as e:
+            logger.warning("ensure leverage %s: %s", symbol, e)
 
     async def _start_market_feed(self):
         mode = (self.settings.MARKET_FEED or "ws").lower()
@@ -1464,6 +1488,7 @@ class StrategyEngine:
         pos = self.positions[symbol]
         if not pos.is_flat:
             return
+        await self._ensure_symbol_leverage(symbol)
         margin = await self._order_margin_budget(symbol, for_add=False)
         qty, mark = await self._calc_order_qty(symbol, margin)
 
@@ -1526,6 +1551,7 @@ class StrategyEngine:
                 f"add_count={pos.add_count} | {reason}",
             )
             return
+        await self._ensure_symbol_leverage(symbol)
         margin = await self._order_margin_budget(symbol, for_add=True)
         qty, mark = await self._calc_order_qty(symbol, margin)
         # 预算过小达不到最小名义时，强制按当前仓保证金再试一次

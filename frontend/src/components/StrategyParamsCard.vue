@@ -37,7 +37,10 @@
             <el-input-number v-model="params.leverage" :min="1" :max="125" size="small" controls-position="right" />
           </div>
         </div>
-        <div class="unit" style="margin-top:8px">开仓/加仓：实时（未收盘价估算 RSI + 未收盘放量）；TP2：所选周期收盘；TP1/SL2：等下一根 1m K 收盘建立基准后按实时价触发</div>
+        <div class="unit" style="margin-top:8px">
+          杠杆：「跟随交易所」不改币安设置（新币常为 20x）；要统一成指定倍数请选「手动设置」并保存后重启引擎。
+          开仓/加仓：实时（未收盘价估算 RSI + 未收盘放量）；TP2：所选周期收盘；TP1/SL2：等下一根 1m K 收盘建立基准后按实时价触发
+        </div>
       </section>
 
       <section class="block">
