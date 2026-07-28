@@ -39,7 +39,7 @@
         </div>
         <div class="unit" style="margin-top:8px">
           杠杆：「跟随交易所」不改币安设置（新币常为 20x）；要统一成指定倍数请选「手动设置」并保存后重启引擎。
-          开仓/加仓：实时（未收盘价估算 RSI + 未收盘放量）；TP2：所选周期收盘；TP1/SL2：等下一根 1m K 收盘建立基准后按实时价触发
+          开仓/加仓：实时（未收盘价估算 RSI + 未收盘放量）；TP2：实时 RSI（未收盘 peek）；TP1/SL2：等下一根 1m K 收盘建立基准后按实时价触发
         </div>
       </section>
 
@@ -158,7 +158,7 @@
           <span class="unit">%（同币安仓位「回报率」）</span>
         </div>
         <div class="tp-row">
-          <el-checkbox v-model="params.exit.enable_tp2">TP2 RSI（所选周期收盘）</el-checkbox>
+          <el-checkbox v-model="params.exit.enable_tp2">TP2 RSI（实时）</el-checkbox>
           <span class="unit">多 ≥</span>
           <el-input-number v-model="params.exit.tp2_long_rsi" :min="0" :max="100" :precision="1" size="small" controls-position="right" />
           <span class="unit">空 ≤</span>
@@ -176,7 +176,7 @@
           <p><b>开多：</b>已勾选条件同时满足（默认 RSI≤10 且放量）</p>
           <p><b>开空：</b>默认 RSI≥86 且放量</p>
           <p><b>加仓：</b>一级→二级严格顺序（实时）；加仓后等下一根 1m 收盘重置退出基准</p>
-          <p><b>退出：</b>TP1 回报率≥目标（默认50%，同币安）/ SL2 浮亏（1m收盘后；等基准期仍有 SL2）；TP2 RSI（所选周期收盘）</p>
+          <p><b>退出：</b>TP1 回报率≥目标（默认50%，同币安）/ SL2 浮亏（1m收盘后；等基准期仍有 SL2）；TP2 RSI（实时，未收盘 peek）</p>
         </div>
       </section>
     </template>

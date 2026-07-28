@@ -197,6 +197,34 @@ def test_tp2_long_rsi():
     assert act is None
 
 
+def test_tp2_live_rsi_peek_mid_bar():
+    """收盘 RSI 未达 TP2，live peek 后应能实时平多。"""
+    params = StrategyParams()
+    params.timeframe = "1m"
+    params.exit.enable_tp2 = True
+    # 交替涨跌 → RSI 居中
+    closes = []
+    p = 100.0
+    for i in range(24):
+        p += 1.0 if i % 2 == 0 else -0.8
+        closes.append(p)
+    ind = SymbolIndicators(timeframe="1m", rsi_period=6, volume_lookback=5)
+    ind.bootstrap("1m", closes, [10.0] * len(closes))
+    closed_rsi = ind.get("1m").rsi.value
+    assert closed_rsi is not None and 5 < closed_rsi < 95
+    params.exit.tp2_long_rsi = closed_rsi + 5
+    pos = SymbolPosition(symbol="T")
+    pos.open("LONG", 1, 100, 10)
+    assert StrategyRules.check_tp2(params, ind, pos) is None
+    live_px = closes[-1] * 1.3
+    peeked = ind.get("1m").rsi.peek(live_px)
+    assert peeked is not None and peeked >= params.exit.tp2_long_rsi
+    ind.set_live("1m", close=live_px)
+    act = StrategyRules.check_tp2(params, ind, pos)
+    assert act is not None and act.type == "CLOSE_TP2"
+    assert "RSI=" in act.reason
+
+
 def test_evaluate_entry_mode_ignores_tp2_interval():
     params = StrategyParams()
     params.timeframe = "1m"

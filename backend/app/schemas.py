@@ -127,15 +127,15 @@ class AddConditionConfig(BaseModel):
 
 
 class ExitConfig(BaseModel):
-    """止盈/止损：1m收盘武装后 TP1/SL2 实时；TP2 所选周期收盘。"""
+    """止盈/止损：1m收盘武装后 TP1/SL2 实时；TP2 实时 RSI（live peek）。"""
     model_config = ConfigDict(extra="ignore")
 
     enable_tp1: bool = True
     tp1_profit_pct: float = 50.0            # 浮盈 ≥ 保证金×该比例 止盈
 
     enable_tp2: bool = True
-    tp2_long_rsi: float = 85.0              # 多：RSI ≥
-    tp2_short_rsi: float = 15.0             # 空：RSI ≤
+    tp2_long_rsi: float = 85.0              # 多：实时 RSI ≥
+    tp2_short_rsi: float = 15.0             # 空：实时 RSI ≤
 
     enable_sl1: bool = False                # 已废弃：保本（默认关闭）
 

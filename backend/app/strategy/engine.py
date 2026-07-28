@@ -1065,7 +1065,7 @@ class StrategyEngine:
     async def _on_kline_close(self, symbol: str, interval: str, k: dict):
         """
         收盘：
-        - 交易周期：更新指标；评估 TP2；顺带评估开仓/加仓（RSI 刚更新）
+        - 交易周期：更新指标；再评 TP2（收盘 RSI 兜底）并评估开仓/加仓
         - 1m：若等待基准则用收盘价武装 P0（开始 TP1/SL 计算）
         """
         x = k.get("x")
@@ -1153,7 +1153,7 @@ class StrategyEngine:
 
     async def _handle_tf_close_trade(self, symbol: str, open_ms: int,
                                      close_boundary_ms: int, event_ms: int = 0):
-        """交易周期收盘：TP2；并评估开仓/加仓（RSI 刚收盘更新）。"""
+        """交易周期收盘：再评 TP2（收盘 RSI）并评估开仓/加仓。"""
         if open_ms and self._last_tf_eval_open.get(symbol) == open_ms:
             return
 
@@ -1237,7 +1237,7 @@ class StrategyEngine:
                 name=f"rt-entry-mark-{symbol}",
             )
 
-        # 基准武装后做 TP1/SL2；等待期也检查 SL2
+        # 持仓：实时 TP2（live RSI）+ 基准武装后 TP1/SL2（等待期也查 SL2）
         if pos.is_flat:
             return
         if not pos.baseline_armed and not pos.pending_baseline:
@@ -1272,6 +1272,16 @@ class StrategyEngine:
                     return
                 if not pos.baseline_armed and not pos.pending_baseline:
                     return
+                # 先 TP2（实时 RSI），再 TP1/SL2
+                ind = self.indicators.get(symbol)
+                if ind is not None:
+                    tp2 = StrategyRules.check_tp2(
+                        self.cfg_strategy, ind, pos,
+                        trigger_interval=self._trading_tf(),
+                    )
+                    if tp2 is not None and tp2.type != "NONE":
+                        await self._execute_action(symbol, tp2)
+                        return
                 action = StrategyRules.check_price_exits(self.cfg_strategy, pos, mark)
                 if action is None or action.type == "NONE":
                     return

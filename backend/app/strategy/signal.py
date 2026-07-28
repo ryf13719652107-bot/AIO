@@ -1,9 +1,9 @@
 """
 RSI + 成交量策略规则判定器。
 
-开仓/加仓：实时（未收盘 live VOL + 已收盘 RSI）；已启用条件 AND。
+开仓/加仓：实时（未收盘 live VOL + live/收盘 RSI）；已启用条件 AND。
 加仓：两级严格顺序，各最多一次。
-TP2：所选周期收盘 RSI。
+TP2：实时 RSI（有 live 未收盘价时 peek；否则用已收盘值）。
 TP1/SL2：1m 收盘武装基准后按实时 mark 判定。
 TP1：浮盈≥保证金×目标比例（默认50%）；已取消保本与移动止盈。
 """
@@ -153,13 +153,13 @@ class StrategyRules:
 
     @classmethod
     def check_tp2(cls, params: StrategyParams, ind: SymbolIndicators,
-                  pos: SymbolPosition, *, trigger_interval: str) -> Optional[Action]:
+                  pos: SymbolPosition, *, trigger_interval: Optional[str] = None) -> Optional[Action]:
+        """TP2：实时 RSI（live peek 优先）；trigger_interval 若给定须等于策略周期。"""
         if pos.is_flat or not params.exit.enable_tp2:
             return None
-        if trigger_interval != params.timeframe:
+        if trigger_interval is not None and trigger_interval != params.timeframe:
             return None
-        t = ind.get(params.timeframe)
-        rsi = t.rsi.value if t.rsi.initialized else None
+        _, rsi, _, _ = _tf_metrics(ind, params.timeframe, 1)
         if rsi is None:
             return None
         if pos.direction == "LONG" and rsi >= params.exit.tp2_long_rsi:
@@ -264,7 +264,7 @@ class StrategyRules:
         """
         mode:
           - entry: 仅开仓/加仓（实时）
-          - tp2: 仅 TP2（所选周期收盘）
+          - tp2: 仅 TP2（实时 RSI）
           - all: 持仓先 TP2 再加仓；空仓开仓（兼容旧测试）
         """
         tf = params.timeframe
@@ -272,7 +272,7 @@ class StrategyRules:
             return cls.evaluate_entry(params, ind, pos, allow_open=allow_open)
 
         if mode == "tp2":
-            if trigger_interval != tf or pos.is_flat:
+            if pos.is_flat:
                 return Action()
             tp2 = cls.check_tp2(params, ind, pos, trigger_interval=trigger_interval)
             return tp2 or Action()
