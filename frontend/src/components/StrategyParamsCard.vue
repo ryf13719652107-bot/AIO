@@ -95,27 +95,23 @@
             <el-checkbox v-model="params.entry.enable_long"><b>允许开多</b></el-checkbox>
           </div>
           <template v-if="params.entry.enable_long">
-            <div class="tp-row">
+            <div class="switch-grid">
               <el-checkbox v-model="params.entry.long.ema_5m">5m EMA7 &gt; EMA25</el-checkbox>
               <el-checkbox v-model="params.entry.long.ema_5m_99">5m EMA7&amp;25 均 &gt; EMA99</el-checkbox>
-            </div>
-            <div class="tp-row">
-              <el-checkbox v-model="params.entry.long.rsi">5m RSI(6) &lt;</el-checkbox>
-              <el-input-number v-model="params.entry.long.rsi_threshold" :min="1" :max="85" :precision="0" size="small" controls-position="right" :disabled="!params.entry.long.rsi" />
+              <el-checkbox v-model="params.entry.long.ema_15m_cross">15m EMA7 &gt; EMA25</el-checkbox>
+              <el-checkbox v-model="params.entry.long.ema_15m_over99">15m EMA7&amp;25 均 &gt; EMA99</el-checkbox>
+              <el-checkbox v-model="params.entry.long.ema_30m_cross">30m EMA7 &gt; EMA25</el-checkbox>
+              <el-checkbox v-model="params.entry.long.ema_30m_over99">30m EMA7&amp;25 均 &gt; EMA99</el-checkbox>
+              <el-checkbox v-model="params.entry.long.ema_60m_cross">60m EMA7 &gt; EMA25</el-checkbox>
+              <el-checkbox v-model="params.entry.long.ema_60m_over99">60m EMA7&amp;25 均 &gt; EMA99</el-checkbox>
+              <el-checkbox v-model="params.entry.long.ema_120m_cross">120m EMA7 &gt; EMA25</el-checkbox>
+              <el-checkbox v-model="params.entry.long.ema_120m_over99">120m EMA7&amp;25 均 &gt; EMA99</el-checkbox>
+              <div class="switch-cell">
+                <el-checkbox v-model="params.entry.long.rsi">5m RSI(6) &lt;</el-checkbox>
+                <el-input-number v-model="params.entry.long.rsi_threshold" :min="1" :max="85" :precision="0" size="small" controls-position="right" :disabled="!params.entry.long.rsi" style="width:90px" />
+              </div>
               <el-checkbox v-model="params.entry.long.macd_dif">5m DIF &gt; DEA</el-checkbox>
-              <el-checkbox v-model="params.entry.long.macd_hist">5m MACD柱&lt;0连续3根缩小</el-checkbox>
-            </div>
-            <div class="tp-row">
-              <el-checkbox v-model="params.entry.long.ema_15m_cross">15m 7&gt;25</el-checkbox>
-              <el-checkbox v-model="params.entry.long.ema_15m_over99">15m 均&gt;99</el-checkbox>
-              <el-checkbox v-model="params.entry.long.ema_30m_cross">30m 7&gt;25</el-checkbox>
-              <el-checkbox v-model="params.entry.long.ema_30m_over99">30m 均&gt;99</el-checkbox>
-            </div>
-            <div class="tp-row">
-              <el-checkbox v-model="params.entry.long.ema_60m_cross">60m 7&gt;25</el-checkbox>
-              <el-checkbox v-model="params.entry.long.ema_60m_over99">60m 均&gt;99</el-checkbox>
-              <el-checkbox v-model="params.entry.long.ema_120m_cross">120m 7&gt;25</el-checkbox>
-              <el-checkbox v-model="params.entry.long.ema_120m_over99">120m 均&gt;99</el-checkbox>
+              <el-checkbox v-model="params.entry.long.macd_hist">5m MACD柱 &lt;0 连续3根缩小</el-checkbox>
             </div>
           </template>
         </div>
@@ -124,27 +120,23 @@
             <el-checkbox v-model="params.entry.enable_short"><b>允许开空</b></el-checkbox>
           </div>
           <template v-if="params.entry.enable_short">
-            <div class="tp-row">
+            <div class="switch-grid">
               <el-checkbox v-model="params.entry.short.ema_5m">5m EMA7 &lt; EMA25</el-checkbox>
               <el-checkbox v-model="params.entry.short.ema_5m_99">5m EMA7&amp;25 均 &lt; EMA99</el-checkbox>
-            </div>
-            <div class="tp-row">
-              <el-checkbox v-model="params.entry.short.rsi">5m RSI(6) &gt;</el-checkbox>
-              <el-input-number v-model="params.entry.short.rsi_threshold" :min="10" :max="99" :precision="0" size="small" controls-position="right" :disabled="!params.entry.short.rsi" />
+              <el-checkbox v-model="params.entry.short.ema_15m_cross">15m EMA7 &lt; EMA25</el-checkbox>
+              <el-checkbox v-model="params.entry.short.ema_15m_over99">15m EMA7&amp;25 均 &lt; EMA99</el-checkbox>
+              <el-checkbox v-model="params.entry.short.ema_30m_cross">30m EMA7 &lt; EMA25</el-checkbox>
+              <el-checkbox v-model="params.entry.short.ema_30m_over99">30m EMA7&amp;25 均 &lt; EMA99</el-checkbox>
+              <el-checkbox v-model="params.entry.short.ema_60m_cross">60m EMA7 &lt; EMA25</el-checkbox>
+              <el-checkbox v-model="params.entry.short.ema_60m_over99">60m EMA7&amp;25 均 &lt; EMA99</el-checkbox>
+              <el-checkbox v-model="params.entry.short.ema_120m_cross">120m EMA7 &lt; EMA25</el-checkbox>
+              <el-checkbox v-model="params.entry.short.ema_120m_over99">120m EMA7&amp;25 均 &lt; EMA99</el-checkbox>
+              <div class="switch-cell">
+                <el-checkbox v-model="params.entry.short.rsi">5m RSI(6) &gt;</el-checkbox>
+                <el-input-number v-model="params.entry.short.rsi_threshold" :min="10" :max="99" :precision="0" size="small" controls-position="right" :disabled="!params.entry.short.rsi" style="width:90px" />
+              </div>
               <el-checkbox v-model="params.entry.short.macd_dif">5m DIF &lt; DEA</el-checkbox>
-              <el-checkbox v-model="params.entry.short.macd_hist">5m MACD柱&gt;0连续3根缩小</el-checkbox>
-            </div>
-            <div class="tp-row">
-              <el-checkbox v-model="params.entry.short.ema_15m_cross">15m 7&lt;25</el-checkbox>
-              <el-checkbox v-model="params.entry.short.ema_15m_over99">15m 均&lt;99</el-checkbox>
-              <el-checkbox v-model="params.entry.short.ema_30m_cross">30m 7&lt;25</el-checkbox>
-              <el-checkbox v-model="params.entry.short.ema_30m_over99">30m 均&lt;99</el-checkbox>
-            </div>
-            <div class="tp-row">
-              <el-checkbox v-model="params.entry.short.ema_60m_cross">60m 7&lt;25</el-checkbox>
-              <el-checkbox v-model="params.entry.short.ema_60m_over99">60m 均&lt;99</el-checkbox>
-              <el-checkbox v-model="params.entry.short.ema_120m_cross">120m 7&lt;25</el-checkbox>
-              <el-checkbox v-model="params.entry.short.ema_120m_over99">120m 均&lt;99</el-checkbox>
+              <el-checkbox v-model="params.entry.short.macd_hist">5m MACD柱 &gt;0 连续3根缩小</el-checkbox>
             </div>
           </template>
         </div>
@@ -386,6 +378,18 @@ watch(() => props.params, ensureDefaults, { deep: true, immediate: true })
   margin-bottom: 8px;
 }
 .tp-row:last-child { margin-bottom: 0; }
+/* 开关两列网格：左列 EMA7 vs 25，右列 均 vs EMA99，按周期成行对齐 */
+.switch-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 2px 16px;
+  align-items: center;
+}
+.switch-grid .el-checkbox { margin-right: 0; height: 28px; }
+.switch-grid .el-checkbox :deep(.el-checkbox__label) {
+  font-size: 12.5px; white-space: nowrap;
+}
+.switch-cell { display: flex; align-items: center; gap: 6px; min-width: 0; }
 .tp6-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 10px; }
 .tp6-col {
   background: #0c0f16; border: 1px solid #1d2330; border-radius: 8px; padding: 8px 12px;
