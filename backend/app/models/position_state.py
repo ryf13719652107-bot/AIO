@@ -1,8 +1,8 @@
 from datetime import datetime
-from typing import Mapped, Optional
+from typing import Optional
 
 from sqlalchemy import DateTime, String, Text
-from sqlalchemy.orm import mapped_column
+from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database import Base
 
