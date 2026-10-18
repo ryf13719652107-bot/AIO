@@ -174,7 +174,9 @@ class StrategyEngine:
             version_i = 1
 
         if version_i >= 3:
-            # 旧 v3 的单 MACD 开关拆分为 macd_dif / macd_hist（保留用户勾选状态）
+            # 旧 v3 合并开关拆分（保留用户勾选状态）：
+            #   macd → macd_dif / macd_hist
+            #   ema_15m/30m/60m/120m → ema_XX_cross / ema_XX_over99
             entry = dict(strategy.get("entry") or {})
             for side_key in ("long", "short"):
                 side = dict(entry.get(side_key) or {})
@@ -182,6 +184,13 @@ class StrategyEngine:
                     old = side.pop("macd")
                     side.setdefault("macd_dif", old)
                     side.setdefault("macd_hist", old)
+                for tf in ("15m", "30m", "60m", "120m"):
+                    key = f"ema_{tf}"
+                    if isinstance(side.get(key), bool):
+                        old = side.pop(key)
+                        side.setdefault(f"ema_{tf}_cross", old)
+                        side.setdefault(f"ema_{tf}_over99", old)
+                if side:
                     entry[side_key] = side
             if entry:
                 strategy = {**strategy, "entry": entry}

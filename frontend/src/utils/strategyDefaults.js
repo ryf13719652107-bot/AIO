@@ -25,10 +25,10 @@ export function defaultStrategyParams() {
         rsi_threshold: 65,
         macd_dif: true,      // 5m DIF > DEA
         macd_hist: true,     // 5m MACD柱<0且连续3根缩小
-        ema_15m: true,
-        ema_30m: true,
-        ema_60m: true,
-        ema_120m: true,
+        ema_15m_cross: true, ema_15m_over99: true,
+        ema_30m_cross: true, ema_30m_over99: true,
+        ema_60m_cross: true, ema_60m_over99: true,
+        ema_120m_cross: true, ema_120m_over99: true,
       },
       short: {
         ema_5m: true,        // 5m EMA7 < EMA25
@@ -37,10 +37,10 @@ export function defaultStrategyParams() {
         rsi_threshold: 50,
         macd_dif: true,      // 5m DIF < DEA
         macd_hist: true,     // 5m MACD柱>0且连续3根缩小
-        ema_15m: true,
-        ema_30m: true,
-        ema_60m: true,
-        ema_120m: true,
+        ema_15m_cross: true, ema_15m_over99: true,
+        ema_30m_cross: true, ema_30m_over99: true,
+        ema_60m_cross: true, ema_60m_over99: true,
+        ema_120m_cross: true, ema_120m_over99: true,
       },
     },
     order_plan: {
@@ -111,13 +111,26 @@ export function mergeStrategyParams(raw) {
     }
     return merged
   }
-  // 旧 v3 单 MACD 开关拆分为 macd_dif / macd_hist（保留勾选状态）
+  // 旧 v3 合并开关拆分（保留勾选状态）：
+  //   macd → macd_dif / macd_hist
+  //   ema_15m/30m/60m/120m → ema_XX_cross / ema_XX_over99
   const rawEntry = { ...(raw.entry || {}) }
   for (const side of ['long', 'short']) {
     const s = rawEntry[side]
-    if (s && typeof s === 'object' && 'macd' in s && !('macd_dif' in s)) {
-      const { macd, ...rest } = s
-      rawEntry[side] = { ...rest, macd_dif: !!macd, macd_hist: !!macd }
+    if (s && typeof s === 'object') {
+      let cur = s
+      if ('macd' in s && !('macd_dif' in s)) {
+        const { macd, ...rest } = cur
+        cur = { ...rest, macd_dif: !!macd, macd_hist: !!macd }
+      }
+      for (const tf of ['15m', '30m', '60m', '120m']) {
+        const key = `ema_${tf}`
+        if (key in cur && !(`${key}_cross` in cur)) {
+          const { [key]: old, ...rest } = cur
+          cur = { ...rest, [`${key}_cross`]: !!old, [`${key}_over99`]: !!old }
+        }
+      }
+      rawEntry[side] = cur
     }
   }
   return {

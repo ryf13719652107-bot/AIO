@@ -53,24 +53,22 @@ class Action:
     close_pct: float = 100.0     # TP6 分批：平掉整笔订单总仓位的百分比
 
 
+def _cross_ok(t, long_side: bool) -> bool:
+    """高周期条件A：多 EMA7>EMA25；空 EMA7<EMA25。"""
+    e7, e25 = t.ema7.value, t.ema25.value
+    if e7 is None or e25 is None:
+        return False
+    return e7 > e25 if long_side else e7 < e25
+
+
 def _trend_ok(t, long_side: bool) -> bool:
-    """趋势条件（加仓档口径）：多 EMA7>99 且 EMA25>99；空镜像。"""
+    """趋势条件（加仓档 / 高周期条件B口径）：多 EMA7>99 且 EMA25>99；空镜像。"""
     e7, e25, e99 = t.ema7.value, t.ema25.value, t.ema99.value
     if e7 is None or e25 is None or e99 is None:
         return False
     if long_side:
         return e7 > e99 and e25 > e99
     return e7 < e99 and e25 < e99
-
-
-def _trend_strict_ok(t, long_side: bool) -> bool:
-    """趋势条件（开仓高周期口径）：EMA7>(<)EMA25 且 7&25 均>(<)EMA99。"""
-    e7, e25, e99 = t.ema7.value, t.ema25.value, t.ema99.value
-    if e7 is None or e25 is None or e99 is None:
-        return False
-    if long_side:
-        return e7 > e25 and e7 > e99 and e25 > e99
-    return e7 < e25 and e7 < e99 and e25 < e99
 
 
 class StrategyRules:
@@ -154,15 +152,24 @@ class StrategyRules:
         ):
             return False, ""
 
-        # 高周期开仓条件（文档：EMA7>(<)EMA25 且 7&25 均>(<)EMA99）
+        # 高周期开仓条件（文档每周期两项独立开关）：
+        #   cross：EMA7>(<)EMA25；over99：EMA7&25 均>(<)EMA99
         # 键映射：60 分钟→1h，120 分钟→2h（与引擎 K 线订阅键一致）
-        for attr, tf, label in (
-            ("ema_15m", "15m", "15m趋势"),
-            ("ema_30m", "30m", "30m趋势"),
-            ("ema_60m", "1h", "60m趋势"),
-            ("ema_120m", "2h", "120m趋势"),
+        for attr_cross, attr_over, tf in (
+            ("ema_15m_cross", "ema_15m_over99", "15m"),
+            ("ema_30m_cross", "ema_30m_over99", "30m"),
+            ("ema_60m_cross", "ema_60m_over99", "1h"),
+            ("ema_120m_cross", "ema_120m_over99", "2h"),
         ):
-            if not require(getattr(cfg, attr), _trend_strict_ok(ind.get(tf), long_side), label):
+            if not require(
+                getattr(cfg, attr_cross), _cross_ok(ind.get(tf), long_side),
+                f"{tf} EMA7{'>' if long_side else '<'}25",
+            ):
+                return False, ""
+            if not require(
+                getattr(cfg, attr_over), _trend_ok(ind.get(tf), long_side),
+                f"{tf} 7&25均{'>' if long_side else '<'}99",
+            ):
                 return False, ""
 
         if not any_enabled:

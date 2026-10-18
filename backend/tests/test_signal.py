@@ -103,7 +103,8 @@ def test_entry_all_toggles_off_disables_side():
     params = StrategyParams()
     cfg = params.entry.long
     for f in ("ema_5m", "ema_5m_99", "rsi", "macd_dif", "macd_hist",
-              "ema_15m", "ema_30m", "ema_60m", "ema_120m"):
+              "ema_15m_cross", "ema_15m_over99", "ema_30m_cross", "ema_30m_over99",
+              "ema_60m_cross", "ema_60m_over99", "ema_120m_cross", "ema_120m_over99"):
         setattr(cfg, f, False)
     ok, _ = StrategyRules.entry_ready(params, _bull_ind(), "LONG")
     assert not ok
@@ -136,13 +137,30 @@ def test_entry_direction_switch():
 
 
 def test_entry_high_tf_requires_ema7_above_ema25():
-    """高周期开仓条件：EMA7 与 EMA25 均>EMA99 但 EMA7<EMA25 → 不满足。"""
+    """高周期条件A独立：1h EMA7<EMA25（即使均>99）→ 开仓不满足。"""
     params = StrategyParams()
     ind = _bull_ind()
-    # 1h：7&25 均>99 但 7<25
     _set_tf(ind, "1h", e7=101, e25=105, e99=100)
     ok, _ = StrategyRules.entry_ready(params, ind, "LONG")
     assert not ok
+
+
+def test_entry_high_tf_cross_and_over99_independent():
+    """高周期两个开关独立：只勾 7>25（关均>99），1h 均<99 也可开。"""
+    params = StrategyParams()
+    params.entry.long.ema_60m_over99 = False  # 只勾 60m 7>25
+    ind = _bull_ind()
+    _set_tf(ind, "1h", e7=110, e25=105, e99=120)  # 7>25 ✓ 但均>99 ✗
+    ok, reason = StrategyRules.entry_ready(params, ind, "LONG")
+    assert ok and "1h" in reason
+
+    # 只勾 均>99（关 7>25），60m 7<25 也可开
+    params2 = StrategyParams()
+    params2.entry.long.ema_30m_cross = False
+    ind2 = _bull_ind()
+    _set_tf(ind2, "30m", e7=101, e25=105, e99=100)  # 7<25 ✗ 均>99 ✓
+    ok2, reason2 = StrategyRules.entry_ready(params2, ind2, "LONG")
+    assert ok2 and "30m" in reason2
 
 
 # ---------- 回踩加仓 ----------

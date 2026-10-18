@@ -60,10 +60,14 @@ class SideEntryConfig(BaseModel):
     rsi_threshold: float = 65.0  # 多: RSI<阈值(1-85)；空: RSI>阈值(10-99)
     macd_dif: bool = True        # 5m DIF > DEA（空: <）
     macd_hist: bool = True       # 5m MACD柱<0且连续3根缩小（空: >0且连续3根缩小）
-    ema_15m: bool = True         # 15m EMA7>25 且均>99（空镜像）
-    ema_30m: bool = True         # 30m 同上
-    ema_60m: bool = True         # 60m 同上
-    ema_120m: bool = True        # 120m 同上
+    ema_15m_cross: bool = True   # 15m EMA7 > EMA25（空: <）
+    ema_15m_over99: bool = True  # 15m EMA7&25 均 > EMA99（空: 均 <）
+    ema_30m_cross: bool = True   # 30m EMA7 > EMA25（空: <）
+    ema_30m_over99: bool = True  # 30m EMA7&25 均 > EMA99（空: 均 <）
+    ema_60m_cross: bool = True   # 60m EMA7 > EMA25（空: <）
+    ema_60m_over99: bool = True  # 60m EMA7&25 均 > EMA99（空: 均 <）
+    ema_120m_cross: bool = True  # 120m EMA7 > EMA25（空: <）
+    ema_120m_over99: bool = True # 120m EMA7&25 均 > EMA99（空: 均 <）
 
 
 class EntryConditionsConfig(BaseModel):
