@@ -24,32 +24,20 @@ async def init_db():
     from sqlalchemy import text
 
     async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-        # SQLite 兼容迁移：为 position_state 补齐新列
+        # 迁移：旧版（单方向、列式）position_state 结构不兼容 → 重建。
+        # 旧仓不再从本地恢复，引擎启动后会从交易所 adopt 回收。
         def _migrate(sync_conn):
             try:
-                rows = sync_conn.execute(text("PRAGMA table_info(position_state)")).fetchall()
+                rows = sync_conn.execute(
+                    text("PRAGMA table_info(position_state)")
+                ).fetchall()
             except Exception:
                 return
+            if not rows:
+                return
             cols = {r[1] for r in rows}
-            alters = []
-            if "add_count" not in cols:
-                alters.append("ALTER TABLE position_state ADD COLUMN add_count INTEGER DEFAULT 0")
-            if "add_blocked" not in cols:
-                alters.append("ALTER TABLE position_state ADD COLUMN add_blocked BOOLEAN DEFAULT 0")
-            if "pending_baseline" not in cols:
-                alters.append("ALTER TABLE position_state ADD COLUMN pending_baseline BOOLEAN DEFAULT 0")
-            if "baseline_armed" not in cols:
-                alters.append("ALTER TABLE position_state ADD COLUMN baseline_armed BOOLEAN DEFAULT 0")
-            if "baseline_price" not in cols:
-                alters.append("ALTER TABLE position_state ADD COLUMN baseline_price FLOAT DEFAULT 0")
-            if "baseline_pnl" not in cols:
-                alters.append("ALTER TABLE position_state ADD COLUMN baseline_pnl FLOAT DEFAULT 0")
-            if "baseline_open_ms" not in cols:
-                alters.append("ALTER TABLE position_state ADD COLUMN baseline_open_ms INTEGER DEFAULT 0")
-            if "peak_pnl" not in cols:
-                alters.append("ALTER TABLE position_state ADD COLUMN peak_pnl FLOAT DEFAULT 0")
-            for sql in alters:
-                sync_conn.execute(text(sql))
+            if "state_json" not in cols:
+                sync_conn.execute(text("DROP TABLE position_state"))
 
         await conn.run_sync(_migrate)
+        await conn.run_sync(Base.metadata.create_all)

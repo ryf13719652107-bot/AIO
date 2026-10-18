@@ -144,18 +144,22 @@ async def list_logs(
 @router.post("/close/{symbol}")
 async def emergency_close(symbol: str, request: Request,
                           _user: Annotated[User, Depends(get_current_user)]):
-    """紧急平仓单币种。"""
+    """紧急平仓单币种（含双向持仓两腿）。"""
     engine = _engine(request)
     if not engine.running:
         raise HTTPException(status_code=400, detail="引擎未运行")
     sym = symbol.upper()
-    if sym not in engine.positions:
+    legs = engine.positions.get(sym)
+    if legs is None:
         raise HTTPException(status_code=404, detail="未知交易对")
-    pos = engine.positions[sym]
-    if pos.is_flat:
+    if all(p.is_flat for p in legs.values()):
         return {"ok": True, "message": "当前无持仓"}
     async with engine.locks[sym]:
-        await engine._do_close(sym, event="CLOSE_MANUAL", reason="手动紧急平仓")
+        for direction in ("LONG", "SHORT"):
+            if sym in engine.positions and not engine.positions[sym][direction].is_flat:
+                await engine._do_close_leg(
+                    sym, direction, event="CLOSE_MANUAL", reason="手动紧急平仓",
+                )
     return {"ok": True}
 
 

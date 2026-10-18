@@ -93,6 +93,11 @@ class SymbolScreener:
 
             if cfg.enable_volume and quote_vol < cfg.volume_min_usd:
                 continue
+            if (
+                getattr(cfg, "volume_max_usd", None)
+                and quote_vol > cfg.volume_max_usd
+            ):
+                continue
             if cfg.enable_price and price >= cfg.price_max_usd:
                 continue
             if cfg.enable_mcap:

@@ -22,143 +22,157 @@ class UserInfo(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
+# ============ 策略周期 ============
+# 新策略：信号固定 5m；K线订阅 1m/5m/15m/30m/1h/2h
+TIMEFRAMES = ("1m", "5m", "15m", "30m", "1h", "2h")
+STRATEGY_TIMEFRAMES = TIMEFRAMES
+SIGNAL_TIMEFRAME = "5m"
+
+
 # ============ 策略子配置 ============
-# 兼容旧指标订阅；新策略仅使用 STRATEGY_TIMEFRAMES
-TIMEFRAMES = ("1m", "3m", "5m", "15m", "30m", "1h", "2h")
-STRATEGY_TIMEFRAMES = ("1m", "3m", "5m")
-
-
 class ScreeningConfig(BaseModel):
-    """动态选币筛选条件（均可开关）。"""
+    """动态选币筛选条件（均可开关，数值前端可调）。"""
     model_config = ConfigDict(extra="ignore")
 
-    enable_volume: bool = True
-    volume_min_usd: float = 5_000_000.0       # 500 万美元
     enable_mcap: bool = True
-    mcap_min_usd: float = 8_000_000.0         # 800 万美元
-    enable_mcap_max: bool = True
-    mcap_max_usd: float = 6_000_000_000.0     # 60 亿美元
+    mcap_min_usd: float = 15_000_000.0        # 1500 万美元
+    mcap_max_usd: float = 10_000_000_000.0    # 100 亿美元
     enable_price: bool = True
-    price_max_usd: float = 20.0
+    price_max_usd: float = 30.0               # 币价 < 30
+    enable_volume: bool = True
+    volume_min_usd: float = 20_000_000.0      # 24h 成交额 2000 万
+    volume_max_usd: float = 3_000_000_000.0   # 24h 成交额 30 亿
     refresh_hours: float = 1.0
 
 
-class SideSignalConfig(BaseModel):
-    """单方向 RSI + VOL 条件（已启用项 AND；全关则禁用该方向/阶段）。"""
+class SideEntryConfig(BaseModel):
+    """单方向开仓条件（启用项 AND；全关禁用该方向）。
+
+    多头口径：5m EMA7>EMA25；EMA7&25 均>EMA99；RSI6<阈值；
+    DIF>DEA；MACD柱<0 且连续3根缩小；高周期 EMA7>25 且均>99。
+    空头完全镜像。
+    """
     model_config = ConfigDict(extra="ignore")
 
-    enable_rsi: bool = True
-    rsi_threshold: float = 10.0
-    enable_vol: bool = True
-    vol_lookback: int = 30
-    vol_mult: float = 7.0
+    ema_5m: bool = True          # 5m EMA7 > EMA25（空: <）
+    ema_5m_99: bool = True       # 5m EMA7&25 均 > EMA99（空: 均 <）
+    rsi: bool = True             # 5m RSI(6) 阈值判定
+    rsi_threshold: float = 65.0  # 多: RSI<阈值(1-85)；空: RSI>阈值(10-99)
+    macd_dif: bool = True        # 5m DIF > DEA（空: <）
+    macd_hist: bool = True       # 5m MACD柱<0且连续3根缩小（空: >0且连续3根缩小）
+    ema_15m: bool = True         # 15m EMA7>25 且均>99（空镜像）
+    ema_30m: bool = True         # 30m 同上
+    ema_60m: bool = True         # 60m 同上
+    ema_120m: bool = True        # 120m 同上
 
 
-class EntryConditionConfig(BaseModel):
-    """开仓条件。"""
+class EntryConditionsConfig(BaseModel):
+    """开仓条件（双向独立开关）。"""
     model_config = ConfigDict(extra="ignore")
 
     enable_long: bool = True
     enable_short: bool = True
-    long: SideSignalConfig = Field(
-        default_factory=lambda: SideSignalConfig(
-            enable_rsi=True, rsi_threshold=10.0,
-            enable_vol=True, vol_lookback=30, vol_mult=7.0,
-        )
-    )
-    short: SideSignalConfig = Field(
-        default_factory=lambda: SideSignalConfig(
-            enable_rsi=True, rsi_threshold=86.0,
-            enable_vol=True, vol_lookback=30, vol_mult=7.0,
-        )
-    )
+    long: SideEntryConfig = Field(default_factory=lambda: SideEntryConfig(rsi_threshold=65.0))
+    short: SideEntryConfig = Field(default_factory=lambda: SideEntryConfig(rsi_threshold=50.0))
 
 
-class AddLevelConfig(BaseModel):
-    """单级加仓条件。"""
+class OrderPlanConfig(BaseModel):
+    """下单计划：每单保证金 + 首仓/加仓档（加仓档各仅一次）。
+
+    档位（多单）：回踩 mark ≤ 5m EMA7 / EMA25 / EMA99 各加一单；
+    15m / 30m 趋势条件（该周期收盘满足）各加一单。空单镜像。
+    """
+    model_config = ConfigDict(extra="ignore")
+
+    order_margin_usdt: float = Field(default=1.0, ge=1.0, le=100.0)  # 每单保证金 USDT
+    enable_first: bool = True    # 满足开仓条件直接开首仓
+    add_ema7: bool = True        # 回踩 ≤5m EMA7（空: ≥）
+    add_ema25: bool = True       # 回踩 ≤5m EMA25，仅一次
+    add_ema99: bool = True       # 回踩 ≤5m EMA99，仅一次
+    add_15m: bool = True         # 15m EMA7&25 均>99（空镜像），仅一次
+    add_30m: bool = True         # 30m 同上，仅一次
+
+
+class TP6LevelConfig(BaseModel):
+    """TP6 单档：某周期 RSI 阈值 → 平掉整笔订单总仓位的 close_pct%。"""
     model_config = ConfigDict(extra="ignore")
 
     enabled: bool = True
-    long: SideSignalConfig = Field(
-        default_factory=lambda: SideSignalConfig(
-            enable_rsi=True, rsi_threshold=8.0,
-            enable_vol=True, vol_lookback=30, vol_mult=10.0,
-        )
-    )
-    short: SideSignalConfig = Field(
-        default_factory=lambda: SideSignalConfig(
-            enable_rsi=True, rsi_threshold=90.0,
-            enable_vol=True, vol_lookback=30, vol_mult=10.0,
-        )
+    rsi_threshold: float          # 多: ≥阈值；空: ≤阈值
+    close_pct: float = Field(default=10.0, ge=1.0, le=100.0)
+
+
+def _tp6_long() -> "TP6SideConfig":
+    return TP6SideConfig(
+        t5m=TP6LevelConfig(rsi_threshold=93.0, close_pct=10.0),
+        t15m=TP6LevelConfig(rsi_threshold=95.0, close_pct=20.0),
+        t30m=TP6LevelConfig(rsi_threshold=97.0, close_pct=20.0),
+        t60m=TP6LevelConfig(rsi_threshold=97.0, close_pct=30.0),
+        t60m_120m=TP6LevelConfig(rsi_threshold=96.0, close_pct=20.0),
     )
 
 
-class AddConditionConfig(BaseModel):
-    """两级顺序加仓（各最多一次）。"""
+def _tp6_short() -> "TP6SideConfig":
+    return TP6SideConfig(
+        t5m=TP6LevelConfig(rsi_threshold=10.0, close_pct=10.0),
+        t15m=TP6LevelConfig(rsi_threshold=7.0, close_pct=30.0),
+        t30m=TP6LevelConfig(rsi_threshold=7.0, close_pct=20.0),
+        t60m=TP6LevelConfig(rsi_threshold=8.0, close_pct=30.0),
+        t60m_120m=TP6LevelConfig(rsi_threshold=8.0, close_pct=10.0),
+    )
+
+
+class TP6SideConfig(BaseModel):
+    """TP6 分批止盈：5 档对应 5m / 15m / 30m / 60m / 60m&120m。"""
     model_config = ConfigDict(extra="ignore")
 
-    enabled: bool = True
-    level1: AddLevelConfig = Field(
-        default_factory=lambda: AddLevelConfig(
-            enabled=True,
-            long=SideSignalConfig(
-                enable_rsi=True, rsi_threshold=8.0,
-                enable_vol=True, vol_lookback=30, vol_mult=10.0,
-            ),
-            short=SideSignalConfig(
-                enable_rsi=True, rsi_threshold=90.0,
-                enable_vol=True, vol_lookback=30, vol_mult=10.0,
-            ),
-        )
-    )
-    level2: AddLevelConfig = Field(
-        default_factory=lambda: AddLevelConfig(
-            enabled=True,
-            long=SideSignalConfig(
-                enable_rsi=True, rsi_threshold=6.0,
-                enable_vol=True, vol_lookback=30, vol_mult=15.0,
-            ),
-            short=SideSignalConfig(
-                enable_rsi=True, rsi_threshold=93.0,
-                enable_vol=True, vol_lookback=30, vol_mult=15.0,
-            ),
-        )
-    )
+    t5m: TP6LevelConfig
+    t15m: TP6LevelConfig
+    t30m: TP6LevelConfig
+    t60m: TP6LevelConfig
+    t60m_120m: TP6LevelConfig
+
+
+class TP6Config(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    long: TP6SideConfig = Field(default_factory=_tp6_long)
+    short: TP6SideConfig = Field(default_factory=_tp6_short)
 
 
 class ExitConfig(BaseModel):
-    """止盈/止损：1m收盘武装后 TP1/SL2 实时；TP2 实时 RSI（live peek）。"""
+    """止盈条件（先到先执行；TP1-6 全部按已收盘 K 线判定）。
+
+    TP1: 1m EMA25<EMA99（多，空镜像）；TP2: 5m EMA7<EMA25；
+    TP3: 5m EMA25<EMA99；TP4: 15m EMA7<EMA25；
+    TP5: 5m VOL>前30根均量×倍数；TP6: 多周期 RSI 分批。
+    TP6 任一档执行后触发保本损（剩余仓位 mark 触及开仓均价即全平）。
+    """
     model_config = ConfigDict(extra="ignore")
 
     enable_tp1: bool = True
-    tp1_profit_pct: float = 50.0            # 浮盈 ≥ 保证金×该比例 止盈
-
     enable_tp2: bool = True
-    tp2_long_rsi: float = 85.0              # 多：实时 RSI ≥
-    tp2_short_rsi: float = 15.0             # 空：实时 RSI ≤
-
-    enable_sl1: bool = False                # 已废弃：保本（默认关闭）
-
-    enable_sl2: bool = True
-    sl2_margin_loss_pct: float = 10.0       # 整仓保证金浮亏 %
+    enable_tp3: bool = True
+    enable_tp4: bool = True
+    enable_tp5: bool = True
+    tp5_vol_mult: float = Field(default=10.0, ge=5.0, le=50.0)  # 放量倍数 5-50
+    enable_tp6: bool = True
+    tp6: TP6Config = Field(default_factory=TP6Config)
 
 
 class StrategyParams(BaseModel):
-    """RSI + 成交量策略参数（strategy_version=2）。"""
+    """多周期 EMA/MACD/RSI 策略参数（strategy_version=3，双向持仓）。"""
     model_config = ConfigDict(extra="ignore")
 
-    strategy_version: int = 2
-    timeframe: Literal["1m", "3m", "5m"] = "1m"
-    position_pct: float = 2.0               # 每笔开/加仓：本金×该比例；满三级约 3×
-    rsi_period: int = 6
+    strategy_version: int = 3
 
-    # 杠杆：follow=跟随交易所；manual=手动设置
+    # 杠杆：follow=跟随交易所；manual=手动设置（5/10/20）
     leverage_mode: Literal["follow", "manual"] = "follow"
-    leverage: int = 20
+    leverage: int = 10
 
     screening: ScreeningConfig = Field(default_factory=ScreeningConfig)
-    entry_conditions: EntryConditionConfig = Field(default_factory=EntryConditionConfig)
-    add_conditions: AddConditionConfig = Field(default_factory=AddConditionConfig)
+    entry: EntryConditionsConfig = Field(default_factory=EntryConditionsConfig)
+    order_plan: OrderPlanConfig = Field(default_factory=OrderPlanConfig)
     exit: ExitConfig = Field(default_factory=ExitConfig)
 
 
@@ -213,12 +227,25 @@ class EngineStatus(BaseModel):
     started_at: Optional[datetime] = None
 
 
+class PositionLegView(BaseModel):
+    """单方向持仓视图（双向持仓的一腿）。"""
+    direction: Literal["LONG", "SHORT"]
+    entry_price: float = 0.0
+    quantity: float = 0.0
+    margin_used: float = 0.0
+    unrealized_pnl: float = 0.0
+    orders_count: int = 1        # 已开单数（含首仓与加仓）
+    tp6_fired: bool = False      # 已触发 TP6 分批（保本损武装）
+    breakeven_armed: bool = False
+
+
 class SymbolRuntime(BaseModel):
     symbol: str
     enabled: bool
-    direction: Literal["LONG", "SHORT", "FLAT"] = "FLAT"
+    direction: Literal["LONG", "SHORT", "FLAT"] = "FLAT"  # 兼容：单腿方向
     entry_price: float = 0.0
     quantity: float = 0.0
     margin_used: float = 0.0
     unrealized_pnl: float = 0.0
     mark_price: float = 0.0
+    legs: list[PositionLegView] = Field(default_factory=list)

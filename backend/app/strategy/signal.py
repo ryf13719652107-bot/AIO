@@ -1,17 +1,18 @@
 """
-RSI + 成交量策略规则判定器。
+多周期 EMA/MACD/RSI 策略规则判定器（v3，双向持仓）。
 
-开仓/加仓：实时（未收盘 live VOL + live/收盘 RSI）；已启用条件 AND。
-加仓：两级严格顺序，各最多一次。
-TP2：实时 RSI（有 live 未收盘价时 peek；否则用已收盘值）。
-TP1/SL2：1m 收盘武装基准后按实时 mark 判定。
-TP1：浮盈≥保证金×目标比例（默认50%）；已取消保本与移动止盈。
+- 开仓：5m 收盘 K 判定（边沿触发由引擎负责），已启用条件 AND，全部用已收盘数据。
+- 回踩加仓：实时 mark 价对 5m EMA7/25/99，需先站上（多）/跌破（空）EMA 才武装，
+  武装后回踩触发，各档仅一次。
+- 趋势加仓：15m/30m 收盘满足 EMA 趋势条件，各仅一次。
+- 止盈 TP1-6：全部按已收盘 K 线判定，先到先执行；全平条件优先于 TP6 分批。
+- 保本损：TP6 任一档触发后武装，由引擎按实时 mark 盯价（触及开仓均价全平）。
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal, Optional
 
-from app.schemas import SideSignalConfig, StrategyParams
+from app.schemas import SIGNAL_TIMEFRAME, StrategyParams
 from app.strategy.indicators import SymbolIndicators
 from app.strategy.position import SymbolPosition
 
@@ -19,9 +20,29 @@ ActionType = Literal[
     "NONE",
     "OPEN_LONG", "OPEN_SHORT",
     "ADD",
-    "CLOSE_TP1", "CLOSE_TP2",
-    "CLOSE_SL1", "CLOSE_SL2",
+    "CLOSE_TP1", "CLOSE_TP2", "CLOSE_TP3", "CLOSE_TP4", "CLOSE_TP5", "CLOSE_TP6",
 ]
+
+# 回踩加仓档 → 5m EMA 属性名
+PULLBACK_LEVELS = {
+    "ema7": "ema7",
+    "ema25": "ema25",
+    "ema99": "ema99",
+}
+# 趋势加仓档 → 周期
+TREND_LEVELS = {
+    "t15m": "15m",
+    "t30m": "30m",
+}
+# TP6 档 → 周期（t60m_120m 特殊：60m 与 120m 同时判定）
+# 注意：引擎 K 线键为 1h/2h（60 分钟/120 分钟即 1h/2h）
+TP6_LEVEL_TFS = {
+    "t5m": ("5m",),
+    "t15m": ("15m",),
+    "t30m": ("30m",),
+    "t60m": ("1h",),
+    "t60m_120m": ("1h", "2h"),
+}
 
 
 @dataclass
@@ -29,262 +50,272 @@ class Action:
     type: ActionType = "NONE"
     reason: str = ""
     trigger_key: str = ""
+    close_pct: float = 100.0     # TP6 分批：平掉整笔订单总仓位的百分比
 
 
-def _side_enabled(cfg: SideSignalConfig) -> bool:
-    return bool(cfg.enable_rsi or cfg.enable_vol)
+def _trend_ok(t, long_side: bool) -> bool:
+    """趋势条件（加仓档口径）：多 EMA7>99 且 EMA25>99；空镜像。"""
+    e7, e25, e99 = t.ema7.value, t.ema25.value, t.ema99.value
+    if e7 is None or e25 is None or e99 is None:
+        return False
+    if long_side:
+        return e7 > e99 and e25 > e99
+    return e7 < e99 and e25 < e99
 
 
-def _check_side_signal(
-    cfg: SideSignalConfig,
-    *,
-    rsi: Optional[float],
-    vol_latest: Optional[float],
-    vol_avg: Optional[float],
-    long_side: bool,
-) -> tuple[bool, str]:
-    """已启用条件 AND；无启用项返回 False。"""
-    if not _side_enabled(cfg):
-        return False, ""
-
-    parts: list[str] = []
-
-    if cfg.enable_rsi:
-        if rsi is None:
-            return False, ""
-        if long_side:
-            if rsi > cfg.rsi_threshold:
-                return False, ""
-            parts.append(f"RSI={rsi:.1f}≤{cfg.rsi_threshold:g}")
-        else:
-            if rsi < cfg.rsi_threshold:
-                return False, ""
-            parts.append(f"RSI={rsi:.1f}≥{cfg.rsi_threshold:g}")
-
-    if cfg.enable_vol:
-        if vol_latest is None or vol_avg is None or vol_avg <= 0:
-            return False, ""
-        threshold = vol_avg * cfg.vol_mult
-        if vol_latest <= threshold:
-            return False, ""
-        parts.append(f"VOL={vol_latest:.2f}>{cfg.vol_mult:g}×均={threshold:.2f}")
-
-    return True, "+".join(parts)
-
-
-def _tf_metrics(ind: SymbolIndicators, timeframe: str, lookback: int):
-    """
-    指标口径（实时开仓）：
-    - RSI：有 live 未收盘价时用 peek 估算；否则用已收盘 Wilder 值
-    - VOL：有 live 未收盘量时用 live vs 最近 N 根已收盘均量；
-           否则用最新已收盘量 vs 其前 N 根均量（avg_prior）
-    """
-    t = ind.get(timeframe)
-    rsi = t.rsi.value if t.rsi.initialized else None
-    if t.live_close is not None and t.rsi.initialized:
-        peeked = t.rsi.peek(t.live_close)
-        if peeked is not None:
-            rsi = peeked
-    if t.live_volume is not None:
-        vol_latest = t.live_volume
-        vol_avg = t.volume.avg_closed(lookback)
-    else:
-        vol_latest = t.volume.latest
-        vol_avg = t.volume.avg_prior(lookback)
-    return t, rsi, vol_latest, vol_avg
+def _trend_strict_ok(t, long_side: bool) -> bool:
+    """趋势条件（开仓高周期口径）：EMA7>(<)EMA25 且 7&25 均>(<)EMA99。"""
+    e7, e25, e99 = t.ema7.value, t.ema25.value, t.ema99.value
+    if e7 is None or e25 is None or e99 is None:
+        return False
+    if long_side:
+        return e7 > e25 and e7 > e99 and e25 > e99
+    return e7 < e25 and e7 < e99 and e25 < e99
 
 
 class StrategyRules:
     """无状态规则引擎。"""
 
+    # ---------- 开仓（5m 收盘判定） ----------
     @staticmethod
-    def long_entry_ready(params: StrategyParams, ind: SymbolIndicators) -> tuple[bool, str]:
-        entry = params.entry_conditions
-        if not entry.enable_long:
+    def entry_ready(params: StrategyParams, ind: SymbolIndicators,
+                    direction: str) -> tuple[bool, str]:
+        entry = params.entry
+        long_side = direction == "LONG"
+        if long_side and not entry.enable_long:
             return False, ""
-        cfg = entry.long
-        if not _side_enabled(cfg):
+        if not long_side and not entry.enable_short:
             return False, ""
-        _, rsi, vol_latest, vol_avg = _tf_metrics(ind, params.timeframe, cfg.vol_lookback)
-        return _check_side_signal(
-            cfg, rsi=rsi, vol_latest=vol_latest, vol_avg=vol_avg, long_side=True,
-        )
+        cfg = entry.long if long_side else entry.short
 
-    @staticmethod
-    def short_entry_ready(params: StrategyParams, ind: SymbolIndicators) -> tuple[bool, str]:
-        entry = params.entry_conditions
-        if not entry.enable_short:
-            return False, ""
-        cfg = entry.short
-        if not _side_enabled(cfg):
-            return False, ""
-        _, rsi, vol_latest, vol_avg = _tf_metrics(ind, params.timeframe, cfg.vol_lookback)
-        return _check_side_signal(
-            cfg, rsi=rsi, vol_latest=vol_latest, vol_avg=vol_avg, long_side=False,
-        )
+        t5 = ind.get(SIGNAL_TIMEFRAME)
+        parts: list[str] = []
+        any_enabled = False
 
-    @staticmethod
-    def add_level_ready(params: StrategyParams, ind: SymbolIndicators,
-                        pos: SymbolPosition, level: int) -> tuple[bool, str]:
-        add = params.add_conditions
-        if not add.enabled:
-            return False, ""
-        if not pos.can_add_level(level):
-            return False, ""
-        level_cfg = add.level1 if level == 1 else add.level2
-        if not level_cfg.enabled:
-            return False, ""
-        cfg = level_cfg.long if pos.direction == "LONG" else level_cfg.short
-        if not _side_enabled(cfg):
-            return False, ""
-        # 加仓两侧 VOL 参数通常镜像；以当前方向 cfg 为准，lookback 取该侧
-        lookback = cfg.vol_lookback
-        # level 配置里 long/short 的 lookback 可能不一致，兜底用 entry
-        if lookback <= 0:
-            lookback = params.entry_conditions.long.vol_lookback
-        _, rsi, vol_latest, vol_avg = _tf_metrics(ind, params.timeframe, lookback)
-        ok, reason = _check_side_signal(
-            cfg, rsi=rsi, vol_latest=vol_latest, vol_avg=vol_avg,
-            long_side=(pos.direction == "LONG"),
-        )
-        if not ok:
-            return False, ""
-        return True, f"加仓{level}: {reason}"
+        def require(enabled: bool, ok: bool, label: str) -> bool:
+            nonlocal any_enabled
+            if not enabled:
+                return True
+            any_enabled = True
+            if not ok:
+                return False
+            parts.append(label)
+            return True
 
+        def _val(x):
+            return x is not None
+
+        e7, e25, e99 = t5.ema7.value, t5.ema25.value, t5.ema99.value
+        ema_ready = _val(e7) and _val(e25) and _val(e99)
+
+        if not require(
+            cfg.ema_5m,
+            ema_ready and (e7 > e25 if long_side else e7 < e25),
+            f"5m EMA7{'>' if long_side else '<'}EMA25",
+        ):
+            return False, ""
+        if not require(
+            cfg.ema_5m_99,
+            ema_ready and (
+                (e7 > e99 and e25 > e99) if long_side else (e7 < e99 and e25 < e99)
+            ),
+            f"5m EMA7&25{'均>' if long_side else '均<'}EMA99",
+        ):
+            return False, ""
+
+        rsi = t5.rsi.value
+        rsi_ok = rsi is not None and (
+            rsi < cfg.rsi_threshold if long_side else rsi > cfg.rsi_threshold
+        )
+        if not require(
+            cfg.rsi, rsi_ok,
+            f"RSI={rsi:.1f}{'<' if long_side else '>'}{cfg.rsi_threshold:g}",
+        ):
+            return False, ""
+
+        # 5m MACD 两个独立条件（文档第6/7行）：DIF>(<)DEA；柱0轴下(上)连续3根缩小
+        macd = t5.macd
+        dif_ok = (
+            macd.dif is not None and macd.dea is not None
+            and (macd.dif > macd.dea if long_side else macd.dif < macd.dea)
+        )
+        if not require(
+            cfg.macd_dif, dif_ok,
+            f"5m DIF{'>' if long_side else '<'}DEA",
+        ):
+            return False, ""
+        hist_ok = (
+            macd.hist_shrinking_below_zero() if long_side
+            else macd.hist_shrinking_above_zero()
+        )
+        if not require(
+            cfg.macd_hist, hist_ok,
+            "MACD柱<0连3缩" if long_side else "MACD柱>0连3缩",
+        ):
+            return False, ""
+
+        # 高周期开仓条件（文档：EMA7>(<)EMA25 且 7&25 均>(<)EMA99）
+        # 键映射：60 分钟→1h，120 分钟→2h（与引擎 K 线订阅键一致）
+        for attr, tf, label in (
+            ("ema_15m", "15m", "15m趋势"),
+            ("ema_30m", "30m", "30m趋势"),
+            ("ema_60m", "1h", "60m趋势"),
+            ("ema_120m", "2h", "120m趋势"),
+        ):
+            if not require(getattr(cfg, attr), _trend_strict_ok(ind.get(tf), long_side), label):
+                return False, ""
+
+        if not any_enabled:
+            return False, ""
+        return True, "+".join(parts)
+
+    # ---------- 回踩加仓（mark 实时判定，武装后触发，各档仅一次） ----------
     @classmethod
-    def check_tp2(cls, params: StrategyParams, ind: SymbolIndicators,
-                  pos: SymbolPosition, *, trigger_interval: Optional[str] = None) -> Optional[Action]:
-        """TP2：实时 RSI（live peek 优先）；trigger_interval 若给定须等于策略周期。"""
-        if pos.is_flat or not params.exit.enable_tp2:
+    def check_pullback(cls, params: StrategyParams, ind: SymbolIndicators,
+                       pos: SymbolPosition, mark: float) -> Optional[Action]:
+        if pos.is_flat or pos.add_blocked or mark <= 0:
             return None
-        if trigger_interval is not None and trigger_interval != params.timeframe:
+        plan = params.order_plan
+        t5 = ind.get(SIGNAL_TIMEFRAME)
+        long_side = pos.direction == "LONG"
+
+        for key, enabled in (
+            ("ema7", plan.add_ema7),
+            ("ema25", plan.add_ema25),
+            ("ema99", plan.add_ema99),
+        ):
+            if not enabled or pos.is_leg_fired(key):
+                continue
+            ema_val = getattr(t5, PULLBACK_LEVELS[key]).value
+            if ema_val is None:
+                continue
+            if long_side:
+                if mark > ema_val:
+                    pos.set_pullback_armed(key, True)
+                elif pos.get_pullback_armed(key) and mark <= ema_val:
+                    return Action(
+                        type="ADD", trigger_key=key,
+                        reason=f"回踩≤5m {key.upper()}={ema_val:.6f} (mark={mark:.6f})",
+                    )
+            else:
+                if mark < ema_val:
+                    pos.set_pullback_armed(key, True)
+                elif pos.get_pullback_armed(key) and mark >= ema_val:
+                    return Action(
+                        type="ADD", trigger_key=key,
+                        reason=f"回踩≥5m {key.upper()}={ema_val:.6f} (mark={mark:.6f})",
+                    )
+        return None
+
+    # ---------- 趋势加仓（15m/30m 收盘判定，各仅一次） ----------
+    @classmethod
+    def trend_add_ready(cls, params: StrategyParams, ind: SymbolIndicators,
+                        pos: SymbolPosition, tf: str) -> Optional[Action]:
+        if pos.is_flat or pos.add_blocked:
             return None
-        _, rsi, _, _ = _tf_metrics(ind, params.timeframe, 1)
-        if rsi is None:
+        plan = params.order_plan
+        enabled = plan.add_15m if tf == "15m" else plan.add_30m
+        if not enabled:
             return None
-        if pos.direction == "LONG" and rsi >= params.exit.tp2_long_rsi:
+        key = "t15m" if tf == "15m" else "t30m"
+        if pos.is_leg_fired(key):
+            return None
+        if _trend_ok(ind.get(tf), pos.direction == "LONG"):
             return Action(
-                type="CLOSE_TP2",
-                reason=f"TP2 多 RSI={rsi:.1f}≥{params.exit.tp2_long_rsi:g}",
-            )
-        if pos.direction == "SHORT" and rsi <= params.exit.tp2_short_rsi:
-            return Action(
-                type="CLOSE_TP2",
-                reason=f"TP2 空 RSI={rsi:.1f}≤{params.exit.tp2_short_rsi:g}",
+                type="ADD", trigger_key=key,
+                reason=f"{tf} EMA7&25 均{'>' if pos.direction == 'LONG' else '<'}EMA99",
             )
         return None
 
+    # ---------- 止盈（收盘判定；全平优先于 TP6） ----------
     @classmethod
-    def check_price_exits(cls, params: StrategyParams, pos: SymbolPosition,
-                          mark: float) -> Optional[Action]:
-        """
-        实时退出：
-        - 等待基准期：仅 SL2
-        - 武装后：TP1 保证金盈利目标 + SL2（不再保本/移动止盈）
-        """
-        if pos.is_flat or mark <= 0:
+    def check_exit(cls, params: StrategyParams, ind: SymbolIndicators,
+                   pos: SymbolPosition, trigger_interval: str) -> Optional[Action]:
+        if pos.is_flat:
             return None
         ex = params.exit
-        pnl = pos.unrealized_pnl(mark)
+        long_side = pos.direction == "LONG"
 
-        # 等待 1m 武装期间：只跑硬止损 SL2
-        if not pos.baseline_armed:
-            if pos.pending_baseline and ex.enable_sl2 and pos.margin > 0:
-                loss_limit = pos.margin * (ex.sl2_margin_loss_pct / 100.0)
-                if pnl <= -loss_limit:
+        def ema_cross(tf: str, a: str, b: str, label: str) -> Optional[Action]:
+            """多：ema(a)<ema(b) 触发；空：ema(a)>ema(b) 触发。"""
+            t = ind.get(tf)
+            va, vb = getattr(t, a).value, getattr(t, b).value
+            if va is None or vb is None:
+                return None
+            hit = (va < vb) if long_side else (va > vb)
+            if not hit:
+                return None
+            return Action(
+                type=label,
+                reason=f"{tf} {a.upper()}={va:.6f}{'<' if long_side else '>'}{b.upper()}={vb:.6f}",
+            )
+
+        # TP1：1m EMA25 vs EMA99
+        if ex.enable_tp1 and trigger_interval == "1m":
+            act = ema_cross("1m", "ema25", "ema99", "CLOSE_TP1")
+            if act:
+                return act
+
+        # TP2/TP3/TP5：5m 收盘
+        if trigger_interval == "5m":
+            if ex.enable_tp2:
+                act = ema_cross("5m", "ema7", "ema25", "CLOSE_TP2")
+                if act:
+                    return act
+            if ex.enable_tp3:
+                act = ema_cross("5m", "ema25", "ema99", "CLOSE_TP3")
+                if act:
+                    return act
+            if ex.enable_tp5:
+                vol_latest = ind.get("5m").volume.latest
+                vol_avg = ind.get("5m").volume.avg_prior(30)
+                if (
+                    vol_latest is not None and vol_avg is not None and vol_avg > 0
+                    and vol_latest > vol_avg * ex.tp5_vol_mult
+                ):
                     return Action(
-                        type="CLOSE_SL2",
+                        type="CLOSE_TP5",
                         reason=(
-                            f"SL2 浮亏(等基准): {pnl:.4f} ≤ -保证金×"
-                            f"{ex.sl2_margin_loss_pct:g}% (-{loss_limit:.4f})"
+                            f"5m VOL={vol_latest:.2f}>前30均量{vol_avg:.2f}"
+                            f"×{ex.tp5_vol_mult:g}"
                         ),
                     )
+
+        # TP4：15m EMA7 vs EMA25
+        if ex.enable_tp4 and trigger_interval == "15m":
+            act = ema_cross("15m", "ema7", "ema25", "CLOSE_TP4")
+            if act:
+                return act
+
+        # TP6：分批（各档仅一次；RSI 全部用已收盘值）
+        if not ex.enable_tp6:
             return None
-
-        # SL2：浮亏 ≥ 保证金比例
-        if ex.enable_sl2 and pos.margin > 0:
-            loss_limit = pos.margin * (ex.sl2_margin_loss_pct / 100.0)
-            if pnl <= -loss_limit:
+        tp6_cfg = ex.tp6.long if long_side else ex.tp6.short
+        for key, tfs in TP6_LEVEL_TFS.items():
+            if pos.is_tp6_fired(key):
+                continue
+            level = getattr(tp6_cfg, key)
+            if not level.enabled:
+                continue
+            if trigger_interval not in tfs:
+                continue
+            rsis = [ind.get(tf).rsi.value for tf in tfs]
+            if any(r is None for r in rsis):
+                continue
+            if long_side:
+                hit = all(r >= level.rsi_threshold for r in rsis)
+            else:
+                hit = all(r <= level.rsi_threshold for r in rsis)
+            if hit:
+                rsi_txt = "/".join(f"{r:.1f}" for r in rsis)
                 return Action(
-                    type="CLOSE_SL2",
+                    type="CLOSE_TP6",
+                    trigger_key=key,
+                    close_pct=level.close_pct,
                     reason=(
-                        f"SL2 浮亏: {pnl:.4f} ≤ -保证金×{ex.sl2_margin_loss_pct:g}% "
-                        f"(-{loss_limit:.4f})"
+                        f"TP6 {key} RSI={rsi_txt} "
+                        f"{'≥' if long_side else '≤'}{level.rsi_threshold:g} "
+                        f"平{level.close_pct:g}%"
                     ),
                 )
-
-        # TP1：回报率（浮盈/保证金）达到目标（默认 50%，同币安仓位回报率）
-        if ex.enable_tp1 and pos.margin > 0:
-            target = pos.margin * (ex.tp1_profit_pct / 100.0)
-            if pnl >= target:
-                roe_pct = (pnl / pos.margin) * 100.0
-                return Action(
-                    type="CLOSE_TP1",
-                    reason=(
-                        f"TP1 止盈: 回报率={roe_pct:.2f}% ≥ {ex.tp1_profit_pct:g}% "
-                        f"(浮盈={pnl:.4f}, 保证金={pos.margin:.4f})"
-                    ),
-                )
-
         return None
-
-    @classmethod
-    def evaluate_entry(cls, params: StrategyParams, ind: SymbolIndicators,
-                       pos: SymbolPosition, *, allow_open: bool = True) -> Action:
-        """实时开仓/加仓评估（不依赖收盘触发）。"""
-        if not pos.is_flat:
-            for level in (1, 2):
-                ok, reason = cls.add_level_ready(params, ind, pos, level)
-                if ok:
-                    return Action(
-                        type="ADD",
-                        reason=reason,
-                        trigger_key=f"add{level}",
-                    )
-            return Action()
-
-        if not allow_open:
-            return Action()
-
-        long_ok, long_reason = cls.long_entry_ready(params, ind)
-        if long_ok:
-            return Action(type="OPEN_LONG", reason=f"开多: {long_reason}")
-
-        short_ok, short_reason = cls.short_entry_ready(params, ind)
-        if short_ok:
-            return Action(type="OPEN_SHORT", reason=f"开空: {short_reason}")
-
-        return Action()
-
-    @classmethod
-    def evaluate(cls, params: StrategyParams, ind: SymbolIndicators,
-                 pos: SymbolPosition, *, allow_open: bool = True,
-                 trigger_interval: str = "1m",
-                 mode: str = "all") -> Action:
-        """
-        mode:
-          - entry: 仅开仓/加仓（实时）
-          - tp2: 仅 TP2（实时 RSI）
-          - all: 持仓先 TP2 再加仓；空仓开仓（兼容旧测试）
-        """
-        tf = params.timeframe
-        if mode == "entry":
-            return cls.evaluate_entry(params, ind, pos, allow_open=allow_open)
-
-        if mode == "tp2":
-            if pos.is_flat:
-                return Action()
-            tp2 = cls.check_tp2(params, ind, pos, trigger_interval=trigger_interval)
-            return tp2 or Action()
-
-        # all
-        if trigger_interval != tf:
-            return Action()
-
-        if not pos.is_flat:
-            tp2 = cls.check_tp2(params, ind, pos, trigger_interval=trigger_interval)
-            if tp2:
-                return tp2
-            return cls.evaluate_entry(params, ind, pos, allow_open=False)
-
-        return cls.evaluate_entry(params, ind, pos, allow_open=allow_open)

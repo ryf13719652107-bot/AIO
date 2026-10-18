@@ -2,29 +2,13 @@
   <el-card class="params-card" shadow="never">
     <template #header>
       <b>策略参数设置</b>
-      <span class="hint">RSI+成交量 · 修改后点上方「保存配置」</span>
+      <span class="hint">多周期 EMA/MACD/RSI · 双向持仓 · 修改后点上方「保存配置」</span>
     </template>
 
     <template v-if="ready">
       <section class="block">
         <div class="block-title">基础</div>
         <div class="row">
-          <div class="field">
-            <label>全局周期</label>
-            <el-select v-model="params.timeframe" size="small" style="width:120px">
-              <el-option label="1 分钟" value="1m" />
-              <el-option label="3 分钟" value="3m" />
-              <el-option label="5 分钟" value="5m" />
-            </el-select>
-          </div>
-          <div class="field">
-            <label>仓位比例 %（每笔按本金，开+加仓1+加仓2≈3倍）</label>
-            <el-input-number v-model="params.position_pct" :min="0.1" :max="100" :precision="1" :step="0.5" size="small" controls-position="right" />
-          </div>
-          <div class="field">
-            <label>RSI 周期</label>
-            <el-input-number v-model="params.rsi_period" :min="2" :max="30" size="small" controls-position="right" />
-          </div>
           <div class="field">
             <label>杠杆模式</label>
             <el-select v-model="params.leverage_mode" size="small" style="width:140px">
@@ -34,149 +18,191 @@
           </div>
           <div class="field" v-if="params.leverage_mode === 'manual'">
             <label>手动杠杆</label>
-            <el-input-number v-model="params.leverage" :min="1" :max="125" size="small" controls-position="right" />
+            <el-select v-model="params.leverage" size="small" style="width:100px">
+              <el-option label="5x" :value="5" />
+              <el-option label="10x" :value="10" />
+              <el-option label="20x" :value="20" />
+            </el-select>
+          </div>
+          <div class="field slider-field">
+            <label>每单保证金（USDT，1–100）</label>
+            <el-slider v-model="params.order_plan.order_margin_usdt" :min="1" :max="100" :step="1" show-input size="small" />
+            <div class="unit">名义 = 保证金 × 杠杆 · 首仓与各加仓档相同</div>
           </div>
         </div>
         <div class="unit" style="margin-top:8px">
-          杠杆：「跟随交易所」不改币安设置（新币常为 20x）；要统一成指定倍数请选「手动设置」并保存后重启引擎。
-          开仓/加仓：实时（未收盘价估算 RSI + 未收盘放量）；TP2：实时 RSI（未收盘 peek）；TP1/SL2：等下一根 1m K 收盘建立基准后按实时价触发
+          信号周期固定 5 分钟（收盘判定）；K 线订阅 1m/5m/15m/30m/1h/2h。
+          开仓为边沿触发：启动后先记录条件状态，需由不满足变为满足才开单（防启动追单）。
         </div>
       </section>
 
       <section class="block">
-        <div class="block-title">选币筛选（均可开关 + 改阈值）</div>
+        <div class="block-title">选币筛选（均可开关 + 滑杆调节）</div>
         <div class="grid-3">
-          <div class="param-box">
-            <div class="param-head">
-              <el-switch v-model="params.screening.enable_volume" />
-              <span>24h 成交额下限</span>
-            </div>
-            <el-input-number v-model="volumeMinWan" :min="0" :step="100" :precision="0" :disabled="!params.screening.enable_volume" size="small" controls-position="right" />
-            <div class="unit">单位：万美元 · 默认 500</div>
-          </div>
           <div class="param-box">
             <div class="param-head">
               <el-switch v-model="params.screening.enable_mcap" />
               <span>市值下限</span>
             </div>
-            <el-input-number v-model="mcapMinWan" :min="0" :step="100" :precision="0" :disabled="!params.screening.enable_mcap" size="small" controls-position="right" />
-            <div class="unit">单位：万美元 · 默认 800</div>
+            <el-slider v-model="mcapMinWan" :min="0" :max="50000" :step="100" :show-input="true" size="small" :disabled="!params.screening.enable_mcap" />
+            <div class="unit">单位：万美元 · 默认 1500</div>
           </div>
           <div class="param-box">
             <div class="param-head">
-              <el-switch v-model="params.screening.enable_mcap_max" />
+              <el-switch v-model="params.screening.enable_mcap" />
               <span>市值上限</span>
             </div>
-            <el-input-number v-model="mcapMaxYi" :min="0" :step="10" :precision="0" :disabled="!params.screening.enable_mcap_max" size="small" controls-position="right" />
-            <div class="unit">单位：亿美元 · 默认 60</div>
+            <el-slider v-model="mcapMaxYi" :min="0" :max="2000" :step="10" :show-input="true" size="small" :disabled="!params.screening.enable_mcap" />
+            <div class="unit">单位：亿美元 · 默认 1000</div>
           </div>
           <div class="param-box">
             <div class="param-head">
               <el-switch v-model="params.screening.enable_price" />
               <span>币价上限 (USD)</span>
             </div>
-            <el-input-number v-model="params.screening.price_max_usd" :min="0" :precision="2" :step="1" :disabled="!params.screening.enable_price" size="small" controls-position="right" />
-            <div class="unit">默认 20 美元</div>
+            <el-slider v-model="params.screening.price_max_usd" :min="0" :max="100" :step="0.5" :show-input="true" size="small" :disabled="!params.screening.enable_price" />
+            <div class="unit">默认 30 美元</div>
           </div>
-        </div>
-        <div class="row" style="margin-top:10px">
-          <div class="field">
-            <label>选币刷新间隔（小时）</label>
+          <div class="param-box">
+            <div class="param-head">
+              <el-switch v-model="params.screening.enable_volume" />
+              <span>24h 成交额下限</span>
+            </div>
+            <el-slider v-model="volumeMinWan" :min="0" :max="100000" :step="100" :show-input="true" size="small" :disabled="!params.screening.enable_volume" />
+            <div class="unit">单位：万美元 · 默认 2000</div>
+          </div>
+          <div class="param-box">
+            <div class="param-head">
+              <el-switch v-model="params.screening.enable_volume" />
+              <span>24h 成交额上限</span>
+            </div>
+            <el-slider v-model="volumeMaxYi" :min="0" :max="1000" :step="5" :show-input="true" size="small" :disabled="!params.screening.enable_volume" />
+            <div class="unit">单位：亿美元 · 默认 300</div>
+          </div>
+          <div class="param-box">
+            <div class="param-head">
+              <span>选币刷新间隔（小时）</span>
+            </div>
             <el-input-number v-model="params.screening.refresh_hours" :min="0.5" :max="24" :step="0.5" size="small" controls-position="right" />
           </div>
         </div>
       </section>
 
       <section class="block">
-        <div class="block-title">开仓（已启用条件 AND · 全关则禁该方向）</div>
-        <div class="tp-row">
-          <el-checkbox v-model="params.entry_conditions.enable_long"><b>允许开多</b></el-checkbox>
+        <div class="block-title">开仓条件（5m 收盘判定 · 已勾选项 AND · 全关禁该方向）</div>
+        <div class="side-wrap">
+          <div class="side-head">
+            <el-checkbox v-model="params.entry.enable_long"><b>允许开多</b></el-checkbox>
+          </div>
+          <template v-if="params.entry.enable_long">
+            <div class="tp-row">
+              <el-checkbox v-model="params.entry.long.ema_5m">5m EMA7 &gt; EMA25</el-checkbox>
+              <el-checkbox v-model="params.entry.long.ema_5m_99">5m EMA7&amp;25 均 &gt; EMA99</el-checkbox>
+            </div>
+            <div class="tp-row">
+              <el-checkbox v-model="params.entry.long.rsi">5m RSI(6) &lt;</el-checkbox>
+              <el-input-number v-model="params.entry.long.rsi_threshold" :min="1" :max="85" :precision="0" size="small" controls-position="right" :disabled="!params.entry.long.rsi" />
+              <el-checkbox v-model="params.entry.long.macd_dif">5m DIF &gt; DEA</el-checkbox>
+              <el-checkbox v-model="params.entry.long.macd_hist">5m MACD柱&lt;0连续3根缩小</el-checkbox>
+            </div>
+            <div class="tp-row">
+              <el-checkbox v-model="params.entry.long.ema_15m">15m EMA7&gt;25 均&gt;99</el-checkbox>
+              <el-checkbox v-model="params.entry.long.ema_30m">30m EMA7&gt;25 均&gt;99</el-checkbox>
+              <el-checkbox v-model="params.entry.long.ema_60m">60m EMA7&gt;25 均&gt;99</el-checkbox>
+              <el-checkbox v-model="params.entry.long.ema_120m">120m EMA7&gt;25 均&gt;99</el-checkbox>
+            </div>
+          </template>
         </div>
-        <div class="tp-row" v-if="params.entry_conditions.enable_long">
-          <el-checkbox v-model="params.entry_conditions.long.enable_rsi">RSI ≤</el-checkbox>
-          <el-input-number v-model="params.entry_conditions.long.rsi_threshold" :min="0" :max="100" :precision="1" size="small" controls-position="right" />
-          <el-checkbox v-model="params.entry_conditions.long.enable_vol">VOL &gt; 前</el-checkbox>
-          <el-input-number v-model="params.entry_conditions.long.vol_lookback" :min="5" :max="100" size="small" controls-position="right" />
-          <span class="unit">根均量 ×</span>
-          <el-input-number v-model="params.entry_conditions.long.vol_mult" :min="1" :max="50" :precision="1" size="small" controls-position="right" />
-        </div>
-        <div class="tp-row">
-          <el-checkbox v-model="params.entry_conditions.enable_short"><b>允许开空</b></el-checkbox>
-        </div>
-        <div class="tp-row" v-if="params.entry_conditions.enable_short">
-          <el-checkbox v-model="params.entry_conditions.short.enable_rsi">RSI ≥</el-checkbox>
-          <el-input-number v-model="params.entry_conditions.short.rsi_threshold" :min="0" :max="100" :precision="1" size="small" controls-position="right" />
-          <el-checkbox v-model="params.entry_conditions.short.enable_vol">VOL &gt; 前</el-checkbox>
-          <el-input-number v-model="params.entry_conditions.short.vol_lookback" :min="5" :max="100" size="small" controls-position="right" />
-          <span class="unit">根均量 ×</span>
-          <el-input-number v-model="params.entry_conditions.short.vol_mult" :min="1" :max="50" :precision="1" size="small" controls-position="right" />
+        <div class="side-wrap">
+          <div class="side-head">
+            <el-checkbox v-model="params.entry.enable_short"><b>允许开空</b></el-checkbox>
+          </div>
+          <template v-if="params.entry.enable_short">
+            <div class="tp-row">
+              <el-checkbox v-model="params.entry.short.ema_5m">5m EMA7 &lt; EMA25</el-checkbox>
+              <el-checkbox v-model="params.entry.short.ema_5m_99">5m EMA7&amp;25 均 &lt; EMA99</el-checkbox>
+            </div>
+            <div class="tp-row">
+              <el-checkbox v-model="params.entry.short.rsi">5m RSI(6) &gt;</el-checkbox>
+              <el-input-number v-model="params.entry.short.rsi_threshold" :min="10" :max="99" :precision="0" size="small" controls-position="right" :disabled="!params.entry.short.rsi" />
+              <el-checkbox v-model="params.entry.short.macd_dif">5m DIF &lt; DEA</el-checkbox>
+              <el-checkbox v-model="params.entry.short.macd_hist">5m MACD柱&gt;0连续3根缩小</el-checkbox>
+            </div>
+            <div class="tp-row">
+              <el-checkbox v-model="params.entry.short.ema_15m">15m EMA7&lt;25 均&lt;99</el-checkbox>
+              <el-checkbox v-model="params.entry.short.ema_30m">30m EMA7&lt;25 均&lt;99</el-checkbox>
+              <el-checkbox v-model="params.entry.short.ema_60m">60m EMA7&lt;25 均&lt;99</el-checkbox>
+              <el-checkbox v-model="params.entry.short.ema_120m">120m EMA7&lt;25 均&lt;99</el-checkbox>
+            </div>
+          </template>
         </div>
       </section>
 
       <section class="block">
-        <div class="block-title">加仓（两级顺序 · 各最多一次 · 每级与开仓同为本金×仓位%）</div>
+        <div class="block-title">下单计划（首仓 + 加仓档 · 每档仅一次 · 每档 1u）</div>
         <div class="tp-row">
-          <el-checkbox v-model="params.add_conditions.enabled"><b>启用加仓</b></el-checkbox>
+          <el-checkbox v-model="params.order_plan.enable_first">满足开仓条件直接开首仓</el-checkbox>
         </div>
-        <template v-if="params.add_conditions.enabled">
-          <div class="unit" style="margin-bottom:8px">一级加仓</div>
-          <div class="tp-row">
-            <el-checkbox v-model="params.add_conditions.level1.enabled">启用一级</el-checkbox>
-          </div>
-          <div class="tp-row" v-if="params.add_conditions.level1.enabled">
-            <span class="unit">多 RSI≤</span>
-            <el-checkbox v-model="params.add_conditions.level1.long.enable_rsi" />
-            <el-input-number v-model="params.add_conditions.level1.long.rsi_threshold" :min="0" :max="100" :precision="1" size="small" controls-position="right" />
-            <span class="unit">空 RSI≥</span>
-            <el-checkbox v-model="params.add_conditions.level1.short.enable_rsi" />
-            <el-input-number v-model="params.add_conditions.level1.short.rsi_threshold" :min="0" :max="100" :precision="1" size="small" controls-position="right" />
-            <el-checkbox v-model="params.add_conditions.level1.long.enable_vol">VOL×</el-checkbox>
-            <el-input-number v-model="params.add_conditions.level1.long.vol_mult" :min="1" :max="50" :precision="1" size="small" controls-position="right" />
-          </div>
-          <div class="unit" style="margin:8px 0">二级加仓</div>
-          <div class="tp-row">
-            <el-checkbox v-model="params.add_conditions.level2.enabled">启用二级</el-checkbox>
-          </div>
-          <div class="tp-row" v-if="params.add_conditions.level2.enabled">
-            <span class="unit">多 RSI≤</span>
-            <el-checkbox v-model="params.add_conditions.level2.long.enable_rsi" />
-            <el-input-number v-model="params.add_conditions.level2.long.rsi_threshold" :min="0" :max="100" :precision="1" size="small" controls-position="right" />
-            <span class="unit">空 RSI≥</span>
-            <el-checkbox v-model="params.add_conditions.level2.short.enable_rsi" />
-            <el-input-number v-model="params.add_conditions.level2.short.rsi_threshold" :min="0" :max="100" :precision="1" size="small" controls-position="right" />
-            <el-checkbox v-model="params.add_conditions.level2.long.enable_vol">VOL×</el-checkbox>
-            <el-input-number v-model="params.add_conditions.level2.long.vol_mult" :min="1" :max="50" :precision="1" size="small" controls-position="right" />
+        <div class="tp-row">
+          <el-checkbox v-model="params.order_plan.add_ema7">回踩 ≤5m EMA7（空: ≥）</el-checkbox>
+          <el-checkbox v-model="params.order_plan.add_ema25">回踩 ≤5m EMA25 · 仅一次</el-checkbox>
+          <el-checkbox v-model="params.order_plan.add_ema99">回踩 ≤5m EMA99 · 仅一次</el-checkbox>
+        </div>
+        <div class="tp-row">
+          <el-checkbox v-model="params.order_plan.add_15m">15m 趋势满足加仓 · 仅一次</el-checkbox>
+          <el-checkbox v-model="params.order_plan.add_30m">30m 趋势满足加仓 · 仅一次</el-checkbox>
+        </div>
+        <div class="unit" style="margin-top:6px">
+          回踩判定：需先站上 EMA（多）/跌破 EMA（空）武装后，回踩触及才触发；各档最多 1 单，共 6 单。
+        </div>
+      </section>
+
+      <section class="block">
+        <div class="block-title">止盈条件（全部收盘判定 · 先到先执行 · 全平优先于 TP6 分批）</div>
+        <div class="tp-row">
+          <el-checkbox v-model="params.exit.enable_tp1">TP1 1m EMA25&lt;EMA99（空镜像）全平</el-checkbox>
+        </div>
+        <div class="tp-row">
+          <el-checkbox v-model="params.exit.enable_tp2">TP2 5m EMA7&lt;EMA25（空镜像）全平</el-checkbox>
+        </div>
+        <div class="tp-row">
+          <el-checkbox v-model="params.exit.enable_tp3">TP3 5m EMA25&lt;EMA99（空镜像）全平</el-checkbox>
+        </div>
+        <div class="tp-row">
+          <el-checkbox v-model="params.exit.enable_tp4">TP4 15m EMA7&lt;EMA25（空镜像）全平</el-checkbox>
+        </div>
+        <div class="tp-row">
+          <el-checkbox v-model="params.exit.enable_tp5">TP5 5m 放量 &gt; 前30根均量 ×</el-checkbox>
+          <el-input-number v-model="params.exit.tp5_vol_mult" :min="5" :max="50" :precision="1" size="small" controls-position="right" :disabled="!params.exit.enable_tp5" />
+          <span class="unit">全平（默认10倍，5–50可调）</span>
+        </div>
+        <div class="tp-row">
+          <el-checkbox v-model="params.exit.enable_tp6"><b>TP6 多周期 RSI 分批</b></el-checkbox>
+          <span class="unit">任一档触发后武装保本损（剩余仓位 mark 回到开仓均价全平）</span>
+        </div>
+        <template v-if="params.exit.enable_tp6">
+          <div class="tp6-grid">
+            <div class="tp6-col" v-for="side in tp6Sides" :key="side.key">
+              <div class="side-head"><b>{{ side.label }}</b></div>
+              <div class="tp6-row" v-for="lv in side.levels" :key="lv.key">
+                <el-checkbox v-model="params.exit.tp6[side.key][lv.key].enabled">{{ lv.label }}</el-checkbox>
+                <span class="unit">{{ side.op }}</span>
+                <el-input-number v-model="params.exit.tp6[side.key][lv.key].rsi_threshold" :min="side.min" :max="side.max" :precision="0" size="small" controls-position="right" :disabled="!params.exit.tp6[side.key][lv.key].enabled" />
+                <span class="unit">平</span>
+                <el-input-number v-model="params.exit.tp6[side.key][lv.key].close_pct" :min="1" :max="100" :precision="0" size="small" controls-position="right" :disabled="!params.exit.tp6[side.key][lv.key].enabled" />
+                <span class="unit">%</span>
+              </div>
+            </div>
           </div>
         </template>
       </section>
 
-      <section class="block">
-        <div class="block-title">止盈 / 止损（独立开关 · 先到先执行）</div>
-        <div class="tp-row">
-          <el-checkbox v-model="params.exit.enable_tp1">TP1 回报率止盈</el-checkbox>
-          <el-input-number v-model="params.exit.tp1_profit_pct" :min="1" :max="500" :precision="1" size="small" controls-position="right" />
-          <span class="unit">%（同币安仓位「回报率」）</span>
-        </div>
-        <div class="tp-row">
-          <el-checkbox v-model="params.exit.enable_tp2">TP2 RSI（实时）</el-checkbox>
-          <span class="unit">多 ≥</span>
-          <el-input-number v-model="params.exit.tp2_long_rsi" :min="0" :max="100" :precision="1" size="small" controls-position="right" />
-          <span class="unit">空 ≤</span>
-          <el-input-number v-model="params.exit.tp2_short_rsi" :min="0" :max="100" :precision="1" size="small" controls-position="right" />
-        </div>
-        <div class="tp-row">
-          <el-checkbox v-model="params.exit.enable_sl2">SL2 保证金浮亏</el-checkbox>
-          <el-input-number v-model="params.exit.sl2_margin_loss_pct" :min="0.1" :max="100" :precision="1" size="small" controls-position="right" />
-          <span class="unit">%（实时）</span>
-        </div>
-      </section>
-
       <section class="block hint-block">
         <div class="strategy-hint">
-          <p><b>开多：</b>已勾选条件同时满足（默认 RSI≤10 且放量）</p>
-          <p><b>开空：</b>默认 RSI≥86 且放量</p>
-          <p><b>加仓：</b>一级→二级严格顺序（实时）；加仓后等下一根 1m 收盘重置退出基准</p>
-          <p><b>退出：</b>TP1 回报率≥目标（默认50%，同币安）/ SL2 浮亏（1m收盘后；等基准期仍有 SL2）；TP2 RSI（实时，未收盘 peek）</p>
+          <p><b>开多（示例全部勾选）：</b>5m EMA多头排列 + RSI&lt;65 + MACD柱0轴下连续收缩 + 四个高周期多头排列 → 开多1u</p>
+          <p><b>开空：</b>完全镜像（RSI&gt;50，柱0轴上连续收缩，高周期空头排列）</p>
+          <p><b>加仓：</b>回踩 5m EMA7/25/99 各1单 + 15m/30m 趋势档各1单（各仅一次，双向持仓多空并存）</p>
+          <p><b>止盈：</b>TP1–5 全平（也是止损）；TP6 分批后保本损盯开仓均价；旧仓按开仓时快照参数管理</p>
         </div>
       </section>
     </template>
@@ -190,9 +216,10 @@ import { mergeStrategyParams } from '../utils/strategyDefaults'
 
 const WAN = 10000
 const YI = 100_000_000
-const DEFAULT_VOLUME_WAN = 500
-const DEFAULT_MCAP_WAN = 800
-const DEFAULT_MCAP_MAX_YI = 60
+const DEFAULT_VOLUME_MIN_WAN = 2000
+const DEFAULT_VOLUME_MAX_YI = 300
+const DEFAULT_MCAP_WAN = 1500
+const DEFAULT_MCAP_MAX_YI = 1000
 
 const props = defineProps({
   params: { type: Object, required: true },
@@ -201,37 +228,56 @@ const props = defineProps({
 const ready = computed(() => !!(
   props.params
   && props.params.screening
-  && props.params.entry_conditions
-  && props.params.add_conditions
+  && props.params.entry
+  && props.params.order_plan
   && props.params.exit
 ))
 
-const volumeMinWan = ref(DEFAULT_VOLUME_WAN)
+const volumeMinWan = ref(DEFAULT_VOLUME_MIN_WAN)
+const volumeMaxYi = ref(DEFAULT_VOLUME_MAX_YI)
 const mcapMinWan = ref(DEFAULT_MCAP_WAN)
 const mcapMaxYi = ref(DEFAULT_MCAP_MAX_YI)
 let syncing = false
 
-function usdToWan(usd, fallback) {
-  const n = Number(usd)
-  if (!Number.isFinite(n) || n <= 0) return fallback
-  return Math.round(n / WAN)
-}
+const tp6Sides = [
+  {
+    key: 'long', label: '多单', op: '≥', min: 60, max: 99,
+    levels: [
+      { key: 't5m', label: '5m RSI' },
+      { key: 't15m', label: '15m RSI' },
+      { key: 't30m', label: '30m RSI' },
+      { key: 't60m', label: '60m RSI' },
+      { key: 't60m_120m', label: '60m&120m RSI' },
+    ],
+  },
+  {
+    key: 'short', label: '空单', op: '≤', min: 1, max: 30,
+    levels: [
+      { key: 't5m', label: '5m RSI' },
+      { key: 't15m', label: '15m RSI' },
+      { key: 't30m', label: '30m RSI' },
+      { key: 't60m', label: '60m RSI' },
+      { key: 't60m_120m', label: '60m&120m RSI' },
+    ],
+  },
+]
 
-function usdToYi(usd, fallback) {
+function toWan(usd, fallback) {
   const n = Number(usd)
-  if (!Number.isFinite(n) || n <= 0) return fallback
-  return Math.round(n / YI)
+  return Number.isFinite(n) && n > 0 ? Math.round(n / WAN) : fallback
+}
+function toYi(usd, fallback) {
+  const n = Number(usd)
+  return Number.isFinite(n) && n > 0 ? Math.round(n / YI) : fallback
 }
 
 function syncFromParams() {
   if (!props.params?.screening) return
   syncing = true
-  volumeMinWan.value = usdToWan(props.params.screening.volume_min_usd, DEFAULT_VOLUME_WAN)
-  mcapMinWan.value = usdToWan(props.params.screening.mcap_min_usd, DEFAULT_MCAP_WAN)
-  mcapMaxYi.value = usdToYi(props.params.screening.mcap_max_usd, DEFAULT_MCAP_MAX_YI)
-  props.params.screening.volume_min_usd = volumeMinWan.value * WAN
-  props.params.screening.mcap_min_usd = mcapMinWan.value * WAN
-  props.params.screening.mcap_max_usd = mcapMaxYi.value * YI
+  volumeMinWan.value = toWan(props.params.screening.volume_min_usd, DEFAULT_VOLUME_MIN_WAN)
+  volumeMaxYi.value = toYi(props.params.screening.volume_max_usd, DEFAULT_VOLUME_MAX_YI)
+  mcapMinWan.value = toWan(props.params.screening.mcap_min_usd, DEFAULT_MCAP_WAN)
+  mcapMaxYi.value = toYi(props.params.screening.mcap_max_usd, DEFAULT_MCAP_MAX_YI)
   syncing = false
 }
 
@@ -261,53 +307,28 @@ function ensureDefaults() {
       props.params[k] = merged[k]
     }
   })
-  // 同步加仓两侧 VOL 开关/倍数（UI 共用 long 控件时写回 short）
-  if (props.params.add_conditions?.level1) {
-    props.params.add_conditions.level1.short.enable_vol = props.params.add_conditions.level1.long.enable_vol
-    props.params.add_conditions.level1.short.vol_mult = props.params.add_conditions.level1.long.vol_mult
-    props.params.add_conditions.level1.short.vol_lookback = props.params.add_conditions.level1.long.vol_lookback
-  }
-  if (props.params.add_conditions?.level2) {
-    props.params.add_conditions.level2.short.enable_vol = props.params.add_conditions.level2.long.enable_vol
-    props.params.add_conditions.level2.short.vol_mult = props.params.add_conditions.level2.long.vol_mult
-    props.params.add_conditions.level2.short.vol_lookback = props.params.add_conditions.level2.long.vol_lookback
-  }
   syncFromParams()
 }
 
 watch(volumeMinWan, (v) => {
   if (syncing || !props.params?.screening) return
-  const wan = Number.isFinite(Number(v)) && Number(v) >= 0 ? Math.round(Number(v)) : DEFAULT_VOLUME_WAN
-  if (v == null || v === '') volumeMinWan.value = DEFAULT_VOLUME_WAN
+  const wan = Number.isFinite(Number(v)) && Number(v) >= 0 ? Math.round(Number(v)) : DEFAULT_VOLUME_MIN_WAN
   props.params.screening.volume_min_usd = wan * WAN
 })
-
+watch(volumeMaxYi, (v) => {
+  if (syncing || !props.params?.screening) return
+  const yi = Number.isFinite(Number(v)) && Number(v) >= 0 ? Math.round(Number(v)) : DEFAULT_VOLUME_MAX_YI
+  props.params.screening.volume_max_usd = yi * YI
+})
 watch(mcapMinWan, (v) => {
   if (syncing || !props.params?.screening) return
   const wan = Number.isFinite(Number(v)) && Number(v) >= 0 ? Math.round(Number(v)) : DEFAULT_MCAP_WAN
-  if (v == null || v === '') mcapMinWan.value = DEFAULT_MCAP_WAN
   props.params.screening.mcap_min_usd = wan * WAN
 })
-
 watch(mcapMaxYi, (v) => {
   if (syncing || !props.params?.screening) return
   const yi = Number.isFinite(Number(v)) && Number(v) >= 0 ? Math.round(Number(v)) : DEFAULT_MCAP_MAX_YI
-  if (v == null || v === '') mcapMaxYi.value = DEFAULT_MCAP_MAX_YI
   props.params.screening.mcap_max_usd = yi * YI
-})
-
-// 加仓 VOL 控件写回 short 侧
-watch(() => props.params?.add_conditions?.level1?.long?.enable_vol, (v) => {
-  if (props.params?.add_conditions?.level1?.short) props.params.add_conditions.level1.short.enable_vol = v
-})
-watch(() => props.params?.add_conditions?.level1?.long?.vol_mult, (v) => {
-  if (props.params?.add_conditions?.level1?.short) props.params.add_conditions.level1.short.vol_mult = v
-})
-watch(() => props.params?.add_conditions?.level2?.long?.enable_vol, (v) => {
-  if (props.params?.add_conditions?.level2?.short) props.params.add_conditions.level2.short.enable_vol = v
-})
-watch(() => props.params?.add_conditions?.level2?.long?.vol_mult, (v) => {
-  if (props.params?.add_conditions?.level2?.short) props.params.add_conditions.level2.short.vol_mult = v
 })
 
 onMounted(ensureDefaults)
@@ -335,24 +356,38 @@ watch(() => props.params, ensureDefaults, { deep: true, immediate: true })
 .row { display: flex; flex-wrap: wrap; gap: 12px 16px; align-items: flex-end; }
 .field { display: flex; flex-direction: column; gap: 4px; min-width: 130px; }
 .field label { font-size: 11px; color: #8a93a7; font-weight: 500; }
-.grid-3 { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 10px; }
+.slider-field { min-width: 320px; flex: 1; }
+.grid-3 { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 10px; }
 .param-box {
   background: #0c0f16; border: 1px solid #1d2330; border-radius: 8px; padding: 10px 12px;
   display: flex; flex-direction: column; gap: 8px;
 }
 .param-head { display: flex; align-items: center; gap: 8px; color: #d6dae3; font-size: 12.5px; }
 .unit { font-size: 11px; color: #6b7280; }
+.side-wrap {
+  background: #0c0f16; border: 1px solid #1d2330; border-radius: 8px;
+  padding: 8px 12px; margin-bottom: 8px;
+}
+.side-head { margin-bottom: 6px; color: #d6dae3; font-size: 12.5px; }
 .tp-row {
   display: flex; flex-wrap: wrap; align-items: center; gap: 8px 10px;
-  margin-bottom: 10px;
+  margin-bottom: 8px;
 }
 .tp-row:last-child { margin-bottom: 0; }
+.tp6-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 10px; }
+.tp6-col {
+  background: #0c0f16; border: 1px solid #1d2330; border-radius: 8px; padding: 8px 12px;
+}
+.tp6-row {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 4px 6px; margin-bottom: 6px;
+}
+.tp6-row:last-child { margin-bottom: 0; }
 .hint-block { background: #0d1117; }
 .strategy-hint { font-size: 12.5px; color: #b6bccb; line-height: 1.8; }
 .strategy-hint p { margin: 2px 0; }
 .loading { color: #8a93a7; padding: 12px; text-align: center; }
 :deep(.el-checkbox__label) { color: #b6bccb; font-size: 12.5px; }
-:deep(.el-input-number) { width: 120px; }
+:deep(.el-input-number) { width: 110px; }
 :deep(.el-input-number .el-input__wrapper) {
   background: #1a1f2c !important;
   box-shadow: 0 0 0 1px #2a3344 inset !important;
@@ -366,4 +401,5 @@ watch(() => props.params, ensureDefaults, { deep: true, immediate: true })
   background: #1a1f2c !important;
   box-shadow: 0 0 0 1px #2a3344 inset !important;
 }
+:deep(.el-slider__runway) { background: #1a1f2c; }
 </style>

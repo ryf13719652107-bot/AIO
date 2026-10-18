@@ -1,6 +1,12 @@
 """
-策略主引擎 — 单周期 RSI + 成交量策略。
-动态选币、两级顺序加仓、TP1/TP2/SL1/SL2、持仓状态持久化。
+策略主引擎 — 多周期 EMA/MACD/RSI 策略（v3，双向持仓）。
+
+- K 线订阅 1m/5m/15m/30m/1h/2h；信号周期固定 5m（收盘判定）
+- 开仓边沿触发（防启动追单：启动后首次评估仅记录状态）
+- 首仓 + 5 个加仓档（回踩 mark vs 5m EMA7/25/99 + 15m/30m 趋势），各档仅一次
+- TP1-6 全部收盘判定；TP6 分批后武装保本损（mark 触及开仓均价全平）
+- 规则2：开仓时快照策略参数，旧仓按快照管理
+- 规则3：同币多空双向持仓并存
 """
 
 from __future__ import annotations
@@ -10,7 +16,7 @@ import inspect
 import logging
 import re
 import time
-from collections import defaultdict, deque
+from collections import deque
 from datetime import datetime
 from typing import Optional
 from zoneinfo import ZoneInfo
@@ -25,7 +31,10 @@ from app.exchange.binance_ws import BinanceFuturesWS
 from app.exchange.binance_poller import BinanceFuturesPoller
 from app.exchange.binance_ticker_ws import BinanceTickerBook
 from app.models import EngineState, PositionLog, PositionState, StrategyConfig, Trade
-from app.schemas import GlobalConfig, StrategyConfigPayload, StrategyParams, SymbolConfig
+from app.schemas import (
+    SIGNAL_TIMEFRAME, TIMEFRAMES, GlobalConfig, StrategyConfigPayload,
+    StrategyParams, SymbolConfig,
+)
 from app.strategy.indicators import SymbolIndicators
 from app.strategy.position import SymbolPosition
 from app.strategy.screener import SymbolScreener
@@ -34,14 +43,18 @@ from app.strategy.signal import Action, StrategyRules
 logger = logging.getLogger(__name__)
 
 TZ_CN = ZoneInfo("Asia/Shanghai")
-TF_MS = {"1m": 60_000, "3m": 180_000, "5m": 300_000}
+TF_MS = {
+    "1m": 60_000, "5m": 300_000, "15m": 900_000,
+    "30m": 1_800_000, "1h": 3_600_000, "2h": 7_200_000,
+}
 BOOTSTRAP_LIMIT = 200
 BOOTSTRAP_CONCURRENCY = 2
 BOOTSTRAP_PAUSE_SEC = 0.2
 BOOTSTRAP_SYMBOL_CONCURRENCY = 2
+DIRECTIONS = ("LONG", "SHORT")
 CLOSE_EVENTS = (
-    "CLOSE_TP1", "CLOSE_TP2", "CLOSE_SL1", "CLOSE_SL2",
-    "CLOSE_MANUAL", "CLOSE_EXTERNAL",
+    "CLOSE_TP1", "CLOSE_TP2", "CLOSE_TP3", "CLOSE_TP4", "CLOSE_TP5", "CLOSE_TP6",
+    "CLOSE_BREAKEVEN", "CLOSE_MANUAL", "CLOSE_EXTERNAL",
 )
 
 
@@ -105,7 +118,8 @@ class StrategyEngine:
         self.cfg_symbols: dict[str, SymbolConfig] = {}
 
         self.indicators: dict[str, SymbolIndicators] = {}
-        self.positions: dict[str, SymbolPosition] = {}
+        # symbol → {"LONG": SymbolPosition, "SHORT": SymbolPosition}
+        self.positions: dict[str, dict[str, SymbolPosition]] = {}
         self.locks: dict[str, asyncio.Lock] = {}
 
         self.exchange: Optional[BinanceFuturesClient] = None
@@ -126,29 +140,19 @@ class StrategyEngine:
         self._bootstrap_last_open: dict[tuple[str, str], int] = {}
         self._last_screen_at: Optional[datetime] = None
         self._screen_count: int = 0
-        self._last_tf_eval_open: dict[str, int] = {}
-        self._bar_close_ts: dict[str, datetime] = {}
         self._tf_eval_sem = asyncio.Semaphore(12)
         self._last_kline_open: dict[tuple[str, str], int] = {}
         self._rest_banned_until: float = 0.0
         self._backfill_lock = asyncio.Lock()
         self._backfill_task: Optional[asyncio.Task] = None
         self._run_epoch: int = 0
-        self._mark_exit_busy: set[str] = set()
-        self._entry_busy: set[str] = set()
+        self._mark_busy: set[str] = set()
+        self._last_entry_cond: dict[tuple[str, str], bool] = {}  # 开仓边沿记忆
 
     # ---------------- 配置 ----------------
-    def _trading_tf(self) -> str:
-        tf = self.cfg_strategy.timeframe
-        return tf if tf in TF_MS else "1m"
-
     def _feed_intervals(self) -> list[str]:
-        """交易周期 + 1m（止盈基准武装始终等 1m 收盘）。"""
-        tf = self._trading_tf()
-        out = [tf]
-        if tf != "1m":
-            out.append("1m")
-        return out
+        """全部策略周期。"""
+        return list(TIMEFRAMES)
 
     async def load_config_from_db(self):
         async with AsyncSessionLocal() as db:
@@ -160,77 +164,48 @@ class StrategyEngine:
 
     @staticmethod
     def _normalize_config_payload(raw: dict) -> dict:
-        """将 v1 EMA 配置迁移为 v2 StrategyParams；返回可校验的干净 payload。"""
+        """旧版（v1/v2）配置迁移为 v3；返回可校验的干净 payload。"""
         data = dict(raw or {})
         strategy = dict(data.get("strategy") or {})
-
         version = strategy.get("strategy_version")
         try:
             version_i = int(version) if version is not None else 1
         except (TypeError, ValueError):
             version_i = 1
 
-        entry = strategy.get("entry_conditions")
-        entry_is_v2 = (
-            isinstance(entry, dict)
-            and ("enable_long" in entry or "long" in entry or "short" in entry)
-        )
-        looks_v1 = (
-            version_i < 2
-            or "ema_fast" in strategy
-            or "ema_mid" in strategy
-            or "ema_slow" in strategy
-            or "features" in strategy
-            or "take_profit" in strategy
-            or (entry is not None and not entry_is_v2)
-        )
-
-        # 已是 v2：清洗为合法 StrategyParams
-        if not looks_v1 and version_i >= 2:
+        if version_i >= 3:
+            # 旧 v3 的单 MACD 开关拆分为 macd_dif / macd_hist（保留用户勾选状态）
+            entry = dict(strategy.get("entry") or {})
+            for side_key in ("long", "short"):
+                side = dict(entry.get(side_key) or {})
+                if isinstance(side.get("macd"), bool):
+                    old = side.pop("macd")
+                    side.setdefault("macd_dif", old)
+                    side.setdefault("macd_hist", old)
+                    entry[side_key] = side
+            if entry:
+                strategy = {**strategy, "entry": entry}
             clean = StrategyParams.model_validate(strategy).model_dump()
-            clean["strategy_version"] = 2
-            # 止盈改为固定盈利目标；废弃保本/移动止盈字段
-            exit_cfg = dict(clean.get("exit") or {})
-            exit_cfg["enable_sl1"] = False
-            if not exit_cfg.get("tp1_profit_pct"):
-                exit_cfg["tp1_profit_pct"] = 50.0
-            exit_cfg.pop("tp1_drawdown_pct", None)
-            clean["exit"] = exit_cfg
             data["strategy"] = clean
-            data.setdefault("symbols", data.get("symbols") or [])
-            if "global" not in data and "global_" not in data:
-                data["global"] = {}
-            return StrategyConfigPayload.model_validate(data).model_dump(by_alias=True)
+        else:
+            # v1/v2 → v3：策略参数全部用默认值，仅保留筛选与杠杆设置
+            defaults = StrategyParams().model_dump()
+            old_screening = strategy.get("screening")
+            if isinstance(old_screening, dict):
+                screening = dict(defaults["screening"])
+                for key in screening:
+                    if key in old_screening and old_screening[key] is not None:
+                        screening[key] = old_screening[key]
+                defaults["screening"] = screening
+            if strategy.get("leverage") is not None:
+                try:
+                    defaults["leverage"] = int(strategy["leverage"])
+                except (TypeError, ValueError):
+                    pass
+            if strategy.get("leverage_mode") in ("follow", "manual"):
+                defaults["leverage_mode"] = strategy["leverage_mode"]
+            data["strategy"] = defaults
 
-        # v1 → v2：用默认参数，仅保留筛选数值/开关与部分通用字段
-        defaults = StrategyParams().model_dump()
-        defaults["strategy_version"] = 2
-
-        old_screening = strategy.get("screening")
-        if isinstance(old_screening, dict):
-            screening = dict(defaults["screening"])
-            for key in screening:
-                if key in old_screening and old_screening[key] is not None:
-                    screening[key] = old_screening[key]
-            defaults["screening"] = screening
-
-        if strategy.get("leverage") is not None:
-            try:
-                defaults["leverage"] = int(strategy["leverage"])
-            except (TypeError, ValueError):
-                pass
-        if strategy.get("rsi_period") is not None:
-            try:
-                defaults["rsi_period"] = int(strategy["rsi_period"])
-            except (TypeError, ValueError):
-                pass
-        tf = strategy.get("timeframe")
-        if tf in TF_MS:
-            defaults["timeframe"] = tf
-        if strategy.get("leverage_mode") in ("follow", "manual"):
-            defaults["leverage_mode"] = strategy["leverage_mode"]
-
-        data["strategy"] = defaults
         data.setdefault("symbols", data.get("symbols") or [])
         if "global" not in data and "global_" not in data:
             data["global"] = {}
@@ -259,16 +234,12 @@ class StrategyEngine:
             self.symbols = [s.symbol for s in payload.symbols if s.enabled]
 
     def _ensure_symbol(self, symbol: str):
-        tf = self._trading_tf()
-        p = self.cfg_strategy
         if symbol not in self.indicators:
-            self.indicators[symbol] = SymbolIndicators(
-                timeframe=tf,
-                rsi_period=p.rsi_period,
-                volume_lookback=30,
-            )
+            self.indicators[symbol] = SymbolIndicators(symbol=symbol, timeframes=TIMEFRAMES)
         if symbol not in self.positions:
-            self.positions[symbol] = SymbolPosition(symbol=symbol)
+            self.positions[symbol] = {
+                d: SymbolPosition(symbol=symbol) for d in DIRECTIONS
+            }
         if symbol not in self.locks:
             self.locks[symbol] = asyncio.Lock()
 
@@ -377,53 +348,69 @@ class StrategyEngine:
         cfg = self.cfg_symbols.get(symbol)
         if cfg is not None and not cfg.enabled:
             return False
-        pos = self.positions.get(symbol)
-        if pos is not None and pos.add_blocked:
-            return False
         return True
+
+    # ---------------- 仓位参数快照（规则2） ----------------
+    def _params_for(self, pos: SymbolPosition) -> StrategyParams:
+        """旧仓按开仓时快照管理；无快照用当前配置。"""
+        snap = pos.params_snapshot
+        if snap:
+            try:
+                return StrategyParams.model_validate(snap)
+            except Exception:
+                logger.warning("仓位参数快照解析失败，回退当前配置")
+        return self.cfg_strategy
+
+    def _order_margin_for(self, pos: Optional[SymbolPosition] = None) -> float:
+        """每单保证金：加仓用仓位快照，新单用当前配置。"""
+        if pos is not None and pos.params_snapshot:
+            plan = pos.params_snapshot.get("order_plan") or {}
+            m = plan.get("order_margin_usdt")
+            if isinstance(m, (int, float)) and m > 0:
+                return float(m)
+        return float(self.cfg_strategy.order_plan.order_margin_usdt)
 
     # ---------------- 持仓持久化 ----------------
     async def _persist_position(self, symbol: str):
-        pos = self.positions.get(symbol)
-        if pos is None or pos.is_flat:
-            await self._delete_position_state(symbol)
+        legs = self.positions.get(symbol)
+        if legs is None:
             return
-        async with AsyncSessionLocal() as db:
-            res = await db.execute(select(PositionState).where(PositionState.symbol == symbol))
-            row = res.scalar_one_or_none()
-            if row is None:
-                row = PositionState(symbol=symbol)
-                db.add(row)
-            row.direction = pos.direction
-            row.quantity = pos.quantity
-            row.entry_price = pos.entry_price
-            row.margin = pos.margin
-            row.opened_at = pos.opened_at
-            row.add_count = pos.add_count
-            row.add_blocked = pos.add_blocked
-            row.pending_baseline = pos.pending_baseline
-            row.baseline_armed = pos.baseline_armed
-            row.baseline_price = pos.baseline_price
-            row.baseline_pnl = pos.baseline_pnl
-            row.baseline_open_ms = pos.baseline_open_ms
-            row.peak_pnl = pos.peak_pnl
-            row.updated_at = datetime.utcnow()
-            await db.commit()
+        for direction, pos in legs.items():
+            if pos.is_flat:
+                await self._delete_position_state(symbol, direction)
+                continue
+            async with AsyncSessionLocal() as db:
+                res = await db.execute(
+                    select(PositionState).where(
+                        PositionState.symbol == symbol,
+                        PositionState.direction == direction,
+                    )
+                )
+                row = res.scalar_one_or_none()
+                if row is None:
+                    row = PositionState(symbol=symbol, direction=direction)
+                    db.add(row)
+                row.state_json = pos.to_dict()
+                row.updated_at = datetime.utcnow()
+                await db.commit()
 
-    async def _delete_position_state(self, symbol: str):
+    async def _delete_position_state(self, symbol: str, direction: Optional[str] = None):
         async with AsyncSessionLocal() as db:
-            await db.execute(delete(PositionState).where(PositionState.symbol == symbol))
+            stmt = delete(PositionState).where(PositionState.symbol == symbol)
+            if direction:
+                stmt = stmt.where(PositionState.direction == direction)
+            await db.execute(stmt)
             await db.commit()
 
     async def _load_position_states(self):
-        """启动时从 DB 恢复仓位策略状态（在 adopt 之前）。"""
+        """启动时从 DB 恢复仓位状态（在 adopt 之前）。"""
         async with AsyncSessionLocal() as db:
             res = await db.execute(select(PositionState))
             rows = list(res.scalars().all())
 
         restored = 0
         for row in rows:
-            if not row.symbol or row.direction in (None, "FLAT"):
+            if not row.symbol or row.direction not in DIRECTIONS:
                 continue
             sym = row.symbol
             self._ensure_symbol(sym)
@@ -431,31 +418,20 @@ class StrategyEngine:
                 self.cfg_symbols[sym] = SymbolConfig(symbol=sym, enabled=True)
             if sym not in self.symbols:
                 self.symbols.append(sym)
-
-            pos = self.positions[sym]
-            pos.direction = row.direction  # type: ignore[assignment]
-            pos.quantity = float(row.quantity or 0)
-            pos.entry_price = float(row.entry_price or 0)
-            pos.margin = float(row.margin or 0)
-            pos.opened_at = row.opened_at
-            pos.add_count = int(row.add_count or 0)
-            pos.add_blocked = bool(row.add_blocked)
-            pos.pending_baseline = bool(row.pending_baseline)
-            pos.baseline_armed = bool(row.baseline_armed)
-            pos.baseline_price = float(row.baseline_price or 0)
-            pos.baseline_pnl = float(row.baseline_pnl or 0)
-            pos.baseline_open_ms = int(row.baseline_open_ms or 0)
-            peak = getattr(row, "peak_pnl", None)
-            if peak is not None:
-                pos.peak_pnl = float(peak or 0)
-            elif pos.baseline_armed:
-                pos.peak_pnl = max(0.0, pos.baseline_pnl)
-            if pos.entry_price:
+            try:
+                state = dict(row.state_json or {})
+            except Exception:
+                state = {}
+            pos = SymbolPosition.from_dict(state)
+            pos.symbol = sym
+            pos.direction = row.direction
+            if pos.entry_price and not pos.mark_price:
                 pos.mark_price = pos.entry_price
+            self.positions[sym][row.direction] = pos
             restored += 1
 
         if restored:
-            await self._log("INFO", "engine", f"已从 DB 恢复 {restored} 个仓位策略状态")
+            await self._log("INFO", "engine", f"已从 DB 恢复 {restored} 个仓位状态")
 
     # ---------------- 选币 ----------------
     async def _run_screen_and_sync(self, initial: bool = False):
@@ -467,7 +443,7 @@ class StrategyEngine:
             )
             if not results and (
                 self.cfg_strategy.screening.enable_mcap
-                or self.cfg_strategy.screening.enable_mcap_max
+                or self.cfg_strategy.screening.enable_volume
             ):
                 await self._log(
                     "WARN", "screener",
@@ -475,14 +451,16 @@ class StrategyEngine:
                 )
                 cfg = self.cfg_strategy.model_copy(deep=True)
                 cfg.screening.enable_mcap = False
-                cfg.screening.enable_mcap_max = False
                 results = await self.screener.screen(self.exchange, cfg, refresh_mcap=False)
 
             self._last_screen_at = datetime.now(TZ_CN)
             self._screen_count += 1
 
             screened = [r.symbol for r in results]
-            holding_mem = [s for s, p in self.positions.items() if not p.is_flat]
+            holding_mem = [
+                s for s, legs in self.positions.items()
+                if any(not p.is_flat for p in legs.values())
+            ]
             holding_ex = await self._exchange_holding_symbols()
             new_symbols = list(dict.fromkeys(holding_mem + holding_ex + screened))
             prev_symbols = set(self.symbols)
@@ -494,7 +472,8 @@ class StrategyEngine:
 
             removed = set(self.symbols) - set(new_symbols)
             for sym in removed:
-                if sym in self.positions and self.positions[sym].is_flat:
+                legs = self.positions.get(sym)
+                if legs and all(p.is_flat for p in legs.values()):
                     self.cfg_symbols.pop(sym, None)
 
             self.symbols = new_symbols
@@ -517,7 +496,7 @@ class StrategyEngine:
             await self.save_config_to_db()
             await self._log(
                 "INFO", "screener",
-                f"选币刷新: {len(new_symbols)} 个币种 (周期={self._trading_tf()})",
+                f"选币刷新: {len(new_symbols)} 个币种 (信号周期={SIGNAL_TIMEFRAME})",
             )
         except Exception as e:
             logger.exception("选币刷新失败: %s", e)
@@ -552,6 +531,9 @@ class StrategyEngine:
                     "连接币安 API 超时。请检查网络/代理，确认可访问 fapi.binance.com"
                 ) from e
             self._run_epoch += 1
+            # 规则1：每次接入（启动）清空开仓边沿记忆，重新记录条件状态，
+            # 需条件由不满足变为满足才开单（防启动追单）
+            self._last_entry_cond.clear()
             self.running = True
             self.started_at = datetime.now(TZ_CN)
             if persist:
@@ -562,7 +544,8 @@ class StrategyEngine:
             })
             await self._log(
                 "INFO", "engine",
-                f"引擎启动中：RSI+VOL 策略，周期={self._trading_tf()}…",
+                f"引擎启动中：多周期 EMA/MACD/RSI 策略（v3 双向持仓），"
+                f"信号周期={SIGNAL_TIMEFRAME}…",
             )
             self._boot_task = asyncio.create_task(self._boot_pipeline(persist=persist))
         except Exception:
@@ -584,9 +567,9 @@ class StrategyEngine:
             self._screener_task = asyncio.create_task(self._screener_loop())
             await self._log(
                 "INFO", "engine",
-                f"RSI+VOL 引擎已就绪 (paper={self.paper_trading}, "
-                f"tf={self._trading_tf()}, feed={self.settings.MARKET_FEED}, "
-                f"symbols={len(self.symbols)}, lev_mode={self.cfg_strategy.leverage_mode})",
+                f"策略引擎已就绪 (paper={self.paper_trading}, "
+                f"feed={self.settings.MARKET_FEED}, symbols={len(self.symbols)}, "
+                f"lev_mode={self.cfg_strategy.leverage_mode})",
             )
             self.bus.publish({
                 "type": "engine.status", "running": True, "booting": False,
@@ -608,7 +591,7 @@ class StrategyEngine:
         self.running = False
         self.booting = False
         self._run_epoch = getattr(self, "_run_epoch", 0) + 1
-        self._mark_exit_busy.clear()
+        self._mark_busy.clear()
         for task in (self._boot_task, self._position_sync_task, self._screener_task):
             if task:
                 task.cancel()
@@ -645,11 +628,11 @@ class StrategyEngine:
             paper=self.paper_trading,
         )
         await self.exchange.init()
-        if self.exchange.hedge_mode:
+        if not self.exchange.hedge_mode:
             await self._log(
                 "WARN", "engine",
-                "账户为「双向持仓」模式：策略每币只管理单边，同币多空并存时另一侧可能漏管。"
-                "建议在币安改为「单向持仓」。",
+                "账户为「单向持仓」模式：新策略按双向持仓设计（同币多空并存），"
+                "建议在币安开启「双向持仓」。",
             )
         self.ticker_book = BinanceTickerBook(testnet=self.binance_testnet)
         self.exchange.ticker_book = self.ticker_book
@@ -717,32 +700,37 @@ class StrategyEngine:
         if time.time() < self._rest_banned_until:
             await self._log("WARN", sym, "跳过 bootstrap：REST 熔断中")
             return
-        tf = self._trading_tf()
         ind = self.indicators[sym]
         try:
-            klines = await self._get_klines_safe(sym, tf, limit=BOOTSTRAP_LIMIT)
-            if not klines:
-                return
-            closed = klines[:-1]
-            closes = [float(k[4]) for k in closed]
-            volumes = [float(k[5]) for k in closed]
-            opens = [float(k[1]) for k in closed]
-            ind.bootstrap_timeframe(tf, closes, volumes, opens)
-            if closed:
-                ot = int(closed[-1][0])
-                self._bootstrap_last_open[(sym, tf)] = ot
-                self._last_kline_open[(sym, tf)] = ot
-            await self._log("INFO", sym, f"指标 bootstrap 完成 ({tf}, {len(closed)} 根)")
+            for tf in self._feed_intervals():
+                if time.time() < self._rest_banned_until:
+                    break
+                klines = await self._get_klines_safe(sym, tf, limit=BOOTSTRAP_LIMIT)
+                if not klines:
+                    continue
+                closed = klines[:-1]
+                closes = [float(k[4]) for k in closed]
+                volumes = [float(k[5]) for k in closed]
+                opens = [float(k[1]) for k in closed]
+                ind.bootstrap_timeframe(tf, closes, volumes, opens)
+                if closed:
+                    ot = int(closed[-1][0])
+                    self._bootstrap_last_open[(sym, tf)] = ot
+                    self._last_kline_open[(sym, tf)] = ot
+                await asyncio.sleep(BOOTSTRAP_PAUSE_SEC)
+            await self._log("INFO", sym, f"指标 bootstrap 完成（{len(self._feed_intervals())} 个周期）")
         except Exception as e:
-            logger.error("bootstrap %s %s: %s", sym, tf, e)
+            logger.error("bootstrap %s: %s", sym, e)
             await self._log("ERROR", sym, f"bootstrap 失败: {e}")
         finally:
             if BOOTSTRAP_PAUSE_SEC > 0:
                 await asyncio.sleep(BOOTSTRAP_PAUSE_SEC)
 
     def _symbol_bootstrapped(self, sym: str) -> bool:
-        tf = self._trading_tf()
-        return (sym, tf) in self._bootstrap_last_open
+        return all(
+            (sym, tf) in self._bootstrap_last_open
+            for tf in self._feed_intervals()
+        )
 
     async def _bootstrap_all_symbols(self):
         sem = asyncio.Semaphore(BOOTSTRAP_SYMBOL_CONCURRENCY)
@@ -765,43 +753,44 @@ class StrategyEngine:
             if time.time() < self._rest_banned_until:
                 await self._log("WARN", "engine", "WS 回补跳过：REST 熔断中")
                 return
-            tf = self._trading_tf()
-            await self._log("INFO", "engine", f"WS 重连，开始回补缺失 {tf} K 线…")
+            await self._log("INFO", "engine", "WS 重连，开始回补缺失 K 线…")
             filled = 0
             for sym in list(self.symbols):
                 if time.time() < self._rest_banned_until:
                     break
                 if sym not in self.indicators:
                     continue
-                last = (
-                    self._last_kline_open.get((sym, tf))
-                    or self._bootstrap_last_open.get((sym, tf), 0)
-                )
-                try:
-                    klines = await self._get_klines_safe(sym, tf, limit=50)
-                except Exception as e:
-                    logger.warning("回补 %s %s 失败: %s", sym, tf, e)
-                    await asyncio.sleep(0.3)
-                    continue
-                if not klines:
-                    continue
-                closed = klines[:-1]
-                for row in closed:
+                for tf in self._feed_intervals():
+                    if time.time() < self._rest_banned_until:
+                        break
+                    last = (
+                        self._last_kline_open.get((sym, tf))
+                        or self._bootstrap_last_open.get((sym, tf), 0)
+                    )
                     try:
-                        ot = int(row[0])
-                    except Exception:
+                        klines = await self._get_klines_safe(sym, tf, limit=50)
+                    except Exception as e:
+                        logger.warning("回补 %s %s 失败: %s", sym, tf, e)
+                        await asyncio.sleep(0.3)
                         continue
-                    if last and ot <= last:
+                    if not klines:
                         continue
-                    close_price = float(row[4])
-                    volume = float(row[5])
-                    open_price = float(row[1])
-                    self.indicators[sym].update(tf, close_price, volume, open_price)
-                    self._last_kline_open[(sym, tf)] = ot
-                    self._bootstrap_last_open[(sym, tf)] = ot
-                    last = ot
-                    filled += 1
-                await asyncio.sleep(BOOTSTRAP_PAUSE_SEC)
+                    closed = klines[:-1]
+                    for row in closed:
+                        try:
+                            ot = int(row[0])
+                        except Exception:
+                            continue
+                        if last and ot <= last:
+                            continue
+                        self.indicators[sym].update(
+                            tf, float(row[4]), float(row[5]), float(row[1]),
+                        )
+                        self._last_kline_open[(sym, tf)] = ot
+                        self._bootstrap_last_open[(sym, tf)] = ot
+                        last = ot
+                        filled += 1
+                    await asyncio.sleep(BOOTSTRAP_PAUSE_SEC)
             await self._log("INFO", "engine", f"K 线回补完成，补入 {filled} 根（仅指标，不交易）")
 
     async def _on_ws_reconnect(self):
@@ -908,7 +897,7 @@ class StrategyEngine:
         entry = float(row.get("entryPrice") or 0)
         if self.exchange and self.exchange.hedge_mode:
             side = row.get("positionSide", "BOTH")
-            if side in ("LONG", "SHORT") and qty > 0:
+            if side in DIRECTIONS and qty > 0:
                 return side, qty, entry
             return "FLAT", 0.0, 0.0
         if raw_amt > 0:
@@ -925,7 +914,7 @@ class StrategyEngine:
         return qty * entry / lev
 
     async def _adopt_exchange_positions(self, tag: str = "同步") -> list[str]:
-        """把交易所非零仓位纳入监控；DB 无状态时 adopt(block_add=True)。"""
+        """把交易所非零仓位纳入监控（双向持仓逐腿 adopt）。"""
         if not self.exchange or not self.exchange_api_key or self.paper_trading:
             return []
         try:
@@ -935,8 +924,8 @@ class StrategyEngine:
             return []
 
         added: list[str] = []
-        seen_open: set[str] = set()
-        by_sym: dict[str, list[tuple[str, float, float]]] = defaultdict(list)
+        seen_open: set[tuple[str, str]] = set()
+        by_sym: dict[str, list[tuple[str, float, float]]] = {}
         for row in rows:
             sym = row.get("symbol")
             if not sym:
@@ -944,26 +933,9 @@ class StrategyEngine:
             direction, qty, entry = self._dir_from_exchange_row(row)
             if direction == "FLAT" or qty <= 0:
                 continue
-            by_sym[sym].append((direction, qty, entry))
+            by_sym.setdefault(sym, []).append((direction, qty, entry))
 
-        for sym, legs in by_sym.items():
-            seen_open.add(sym)
-            if len(legs) > 1:
-                pos_mem = self.positions.get(sym)
-                if pos_mem and not pos_mem.is_flat:
-                    matched = [x for x in legs if x[0] == pos_mem.direction]
-                    pick = matched[0] if matched else max(legs, key=lambda x: x[1] * x[2])
-                else:
-                    pick = max(legs, key=lambda x: x[1] * x[2])
-                await self._log(
-                    "WARN", sym,
-                    f"[{tag}] 双向模式同币 {len(legs)} 边持仓，仅管理 {pick[0]} "
-                    f"(建议账户改为单向持仓)",
-                )
-                direction, qty, entry = pick
-            else:
-                direction, qty, entry = legs[0]
-
+        for sym, ex_legs in by_sym.items():
             self._ensure_symbol(sym)
             if sym not in self.cfg_symbols:
                 self.cfg_symbols[sym] = SymbolConfig(symbol=sym, enabled=True)
@@ -971,25 +943,20 @@ class StrategyEngine:
                 self.symbols.append(sym)
                 added.append(sym)
 
-            pos = self.positions[sym]
-            margin = await self._margin_for_qty(sym, qty, entry)
-            was_flat = pos.is_flat
-            if was_flat:
-                # 交易所有仓、内存无仓（含 DB 未恢复）→ 接管并禁止加仓
-                pos.adopt(direction, qty, entry, margin, block_add=True)
-                await self._persist_position(sym)
-                await self._log(
-                    "WARN", sym,
-                    f"[{tag}] 接管交易所持仓 {direction} qty={qty}（禁止加仓，等待1m收盘武装基准）",
-                )
-            else:
-                if pos.direction != direction:
-                    # 方向冲突：按交易所重接管
-                    pos.adopt(direction, qty, entry, margin, block_add=True)
+            for direction, qty, entry in ex_legs:
+                seen_open.add((sym, direction))
+                pos = self.positions[sym][direction]
+                margin = await self._margin_for_qty(sym, qty, entry)
+                if pos.is_flat:
+                    # 交易所有仓、内存无仓（含 DB 未恢复）→ 接管并禁止加仓
+                    pos.adopt(
+                        direction, qty, entry, margin, block_add=True,
+                        params_snapshot=self.cfg_strategy.model_dump(),
+                    )
                     await self._persist_position(sym)
                     await self._log(
                         "WARN", sym,
-                        f"[{tag}] 方向不一致，已按交易所重接管为 {direction}",
+                        f"[{tag}] 接管交易所持仓 {direction} qty={qty}（禁止加仓）",
                     )
                 else:
                     changed = False
@@ -997,12 +964,7 @@ class StrategyEngine:
                         pos.quantity = qty
                         pos.entry_price = entry
                         changed = True
-                    # 校正保证金：旧逻辑可能存了「资金×仓位%」预算，导致 SL2 过晚
                     if margin > 0 and abs(pos.margin - margin) > max(1e-6, margin * 0.02):
-                        await self._log(
-                            "INFO", sym,
-                            f"[{tag}] 校正保证金 {pos.margin:.4f} → {margin:.4f}（按名义/杠杆）",
-                        )
                         pos.margin = margin
                         changed = True
                     if changed:
@@ -1010,25 +972,26 @@ class StrategyEngine:
 
         # 内存有仓但交易所已平 → CLOSE_EXTERNAL
         for sym in list(self.symbols):
-            pos = self.positions.get(sym)
-            if not pos or pos.is_flat:
+            legs = self.positions.get(sym)
+            if not legs:
                 continue
-            if sym not in seen_open:
-                qty, direction = pos.quantity, pos.direction
+            for direction, pos in legs.items():
+                if pos.is_flat or (sym, direction) in seen_open:
+                    continue
                 mark = pos.mark_price or pos.entry_price
                 pnl = pos.unrealized_pnl(mark=mark) if mark else 0.0
                 side = "SELL" if direction == "LONG" else "BUY"
                 await self._record_trade(
                     sym, side, direction, "CLOSE_EXTERNAL",
-                    qty, float(mark or 0), pos.margin,
+                    pos.quantity, float(mark or 0), pos.margin,
                     f"ext-{sym.lower()[:10]}-{int(time.time())}",
                     {"external": True, "tag": tag},
                     realized_pnl=pnl,
                 )
                 await self._log(
                     "WARN", sym,
-                    f"[{tag}] 交易所已无仓（可能强平/手动），记 CLOSE_EXTERNAL "
-                    f"qty={qty} pnl={pnl:.2f}",
+                    f"[{tag}] 交易所已无 {direction} 仓（可能强平/手动），记 CLOSE_EXTERNAL "
+                    f"qty={pos.quantity} pnl={pnl:.2f}",
                 )
                 pos.close()
                 await self._persist_position(sym)
@@ -1063,18 +1026,13 @@ class StrategyEngine:
 
     # ---------------- K 线 / Mark 回调 ----------------
     async def _on_kline_close(self, symbol: str, interval: str, k: dict):
-        """
-        收盘：
-        - 交易周期：更新指标；再评 TP2（收盘 RSI 兜底）并评估开仓/加仓
-        - 1m：若等待基准则用收盘价武装 P0（开始 TP1/SL 计算）
-        """
+        """任意周期收盘：更新指标并调度对应评估。"""
         x = k.get("x")
         if x is not True and str(x).lower() != "true":
             return
-        if symbol not in self.indicators:
+        if symbol not in self.indicators or interval not in TF_MS:
             return
 
-        tf = self._trading_tf()
         try:
             open_ms = int(k.get("t") or 0)
         except Exception:
@@ -1085,32 +1043,10 @@ class StrategyEngine:
         if open_ms and prev_ot is not None and open_ms <= prev_ot:
             return
 
-        close_price = float(k["c"])
-        volume = float(k.get("v", 0) or 0)
-        open_price = float(k.get("o", 0) or 0) or None
-        tf_ms = TF_MS.get(interval, 60_000)
-        close_boundary_ms = open_ms + tf_ms if open_ms > 0 else int(k.get("T") or 0) + 1
-        try:
-            event_ms = int(k.get("_event_ms") or k.get("T") or close_boundary_ms)
-        except Exception:
-            event_ms = close_boundary_ms
-
-        # 1m 收盘：武装退出基准（可与交易周期相同）
-        if interval == "1m":
-            asyncio.create_task(
-                self._handle_1m_baseline_arm(
-                    symbol, close_price, open_ms, close_boundary_ms,
-                ),
-                name=f"1m-baseline-{symbol}",
-            )
-
-        if interval != tf:
-            if open_ms:
-                self._last_kline_open[key] = open_ms
-                self._bootstrap_last_open[key] = open_ms
-            return
-
-        self.indicators[symbol].update(interval, close_price, volume, open_price)
+        self.indicators[symbol].update(
+            interval, float(k["c"]), float(k.get("v", 0) or 0),
+            float(k.get("o", 0) or 0) or None,
+        )
         if open_ms:
             self._last_kline_open[key] = open_ms
             self._bootstrap_last_open[key] = open_ms
@@ -1123,71 +1059,76 @@ class StrategyEngine:
         })
 
         asyncio.create_task(
-            self._handle_tf_close_trade(symbol, open_ms, close_boundary_ms, event_ms),
-            name=f"tf-trade-{symbol}",
+            self._handle_interval_close(symbol, interval),
+            name=f"tf-close-{symbol}-{interval}",
         )
 
-    async def _handle_1m_baseline_arm(self, symbol: str, close_price: float,
-                                      open_ms: int, close_boundary_ms: int):
-        pos = self.positions.get(symbol)
-        if not pos or pos.is_flat or not pos.pending_baseline:
+    async def _handle_interval_close(self, symbol: str, interval: str):
+        """周期收盘评估：TP（全周期）→ 趋势加仓（15m/30m）→ 开仓（5m）。"""
+        if not self._trading_ready() or symbol not in self.indicators:
             return
-        if close_price <= 0:
-            return
-        async with self.locks.setdefault(symbol, asyncio.Lock()):
-            pos = self.positions.get(symbol)
-            if not pos or pos.is_flat or not pos.pending_baseline:
-                return
-            ok = pos.arm_baseline(
-                close_price, open_ms, close_boundary_ms=close_boundary_ms,
-            )
-            if not ok:
-                return
-            await self._persist_position(symbol)
-            await self._log(
-                "INFO", symbol,
-                f"退出基准已武装(1m收盘): 开始TP1/SL2 @ {close_price:.6f} "
-                f"(open_ms={open_ms})",
-            )
-            self.bus.publish({"type": "runtime", "data": self.runtime_snapshot()})
-
-    async def _handle_tf_close_trade(self, symbol: str, open_ms: int,
-                                     close_boundary_ms: int, event_ms: int = 0):
-        """交易周期收盘：再评 TP2（收盘 RSI）并评估开仓/加仓。"""
-        if open_ms and self._last_tf_eval_open.get(symbol) == open_ms:
-            return
-
-        ref_ms = event_ms or close_boundary_ms
-        if close_boundary_ms > 0 and ref_ms > 0:
-            delay = ref_ms - close_boundary_ms
-            if delay > 15_000:
-                logger.warning(
-                    "跳过过期收盘信号 %s open=%s exchange_delay=%dms",
-                    symbol, open_ms, delay,
-                )
-                return
-
-        if open_ms:
-            self._last_tf_eval_open[symbol] = open_ms
-        if close_boundary_ms > 0:
-            self._bar_close_ts[symbol] = datetime.fromtimestamp(
-                close_boundary_ms / 1000.0, TZ_CN,
-            )
-
         async with self._tf_eval_sem:
             async with self.locks.setdefault(symbol, asyncio.Lock()):
-                # 先 TP2，再 entry（开仓/加仓）
-                await self._evaluate_and_execute(
-                    symbol, trigger_interval=self._trading_tf(), mode="tp2",
-                )
-                await self._evaluate_and_execute(
-                    symbol, trigger_interval=self._trading_tf(), mode="entry",
-                )
+                if not self._trading_ready() or symbol not in self.indicators:
+                    return
+                ind = self.indicators[symbol]
+                legs = self.positions[symbol]
+
+                # 1) 止盈（TP1-6，收盘判定，全平优先于分批）
+                for direction in DIRECTIONS:
+                    pos = legs[direction]
+                    if pos.is_flat:
+                        continue
+                    params = self._params_for(pos)
+                    act = StrategyRules.check_exit(params, ind, pos, interval)
+                    if act is not None and act.type != "NONE":
+                        await self._execute_action(symbol, act, direction)
+
+                # 2) 趋势加仓（15m/30m 收盘，各仅一次）
+                if interval in ("15m", "30m") and self.allow_increase_for(symbol):
+                    for direction in DIRECTIONS:
+                        pos = legs[direction]
+                        if pos.is_flat or pos.add_blocked:
+                            continue
+                        params = self._params_for(pos)
+                        act = StrategyRules.trend_add_ready(params, ind, pos, interval)
+                        if act is not None and act.type != "NONE":
+                            await self._execute_action(symbol, act, direction)
+
+                # 3) 开仓评估（仅 5m 收盘；边沿触发防追单）
+                if interval == SIGNAL_TIMEFRAME:
+                    await self._evaluate_entries(symbol, ind)
+
+    async def _evaluate_entries(self, symbol: str, ind: SymbolIndicators):
+        """5m 收盘开仓评估：已启用方向全关则不开；需 false→true 边沿。"""
+        legs = self.positions[symbol]
+        for direction in DIRECTIONS:
+            ok, reason = StrategyRules.entry_ready(self.cfg_strategy, ind, direction)
+            key = (symbol, direction)
+            prev = self._last_entry_cond.get(key)
+            self._last_entry_cond[key] = ok
+            if not ok or prev is not False:
+                # prev=None：启动后首次评估仅记录（规则1）；prev=True：无新边沿
+                continue
+            if not self.cfg_strategy.order_plan.enable_first:
+                continue
+            if not self.allow_open_for(symbol):
+                continue
+            if not legs[direction].is_flat:
+                continue
+            act = Action(
+                type="OPEN_LONG" if direction == "LONG" else "OPEN_SHORT",
+                reason=f"开{'多' if direction == 'LONG' else '空'}: {reason}",
+            )
+            try:
+                await self._execute_action(symbol, act, direction)
+            except Exception as e:
+                logger.exception("开仓执行失败 %s %s: %s", symbol, direction, e)
+                await self._log("ERROR", symbol, f"开仓执行失败: {e}")
 
     async def _on_kline_update(self, symbol: str, interval: str, k: dict):
-        """未收盘 K 更新：刷新 live VOL，实时评估开仓/加仓。"""
-        tf = self._trading_tf()
-        if interval != tf or symbol not in self.indicators:
+        """未收盘 K 更新：仅刷新展示用 live 数据，不参与交易判定。"""
+        if interval != SIGNAL_TIMEFRAME or symbol not in self.indicators:
             return
         x = k.get("x")
         if x is True or str(x).lower() == "true":
@@ -1197,103 +1138,84 @@ class StrategyEngine:
             close_price = float(k.get("c", 0) or 0)
         except Exception:
             return
-        self.indicators[symbol].set_live(tf, volume=volume, close=close_price or None)
+        self.indicators[symbol].set_live(
+            interval, volume=volume, close=close_price or None,
+        )
         self.bus.publish({
             "type": "indicator",
             "symbol": symbol,
             "interval": interval,
             "snapshot": self.indicators[symbol].snapshot(),
         })
-        if not self._trading_ready():
-            return
-        if symbol in self._entry_busy:
-            return
-        self._entry_busy.add(symbol)
-        asyncio.create_task(
-            self._handle_realtime_entry(symbol),
-            name=f"rt-entry-{symbol}",
-        )
 
     async def _on_mark_price(self, symbol: str, mark: float):
         if self.exchange:
             self.exchange.update_mark_price(symbol, mark)
-        pos = self.positions.get(symbol)
-        if not pos:
+        legs = self.positions.get(symbol)
+        if legs is None:
             return
-        pos.mark_price = mark
-        if not self._trading_ready():
+        for pos in legs.values():
+            pos.mark_price = mark
+        if not self._trading_ready() or mark <= 0:
             return
-
-        # 用最新 mark 作为未收盘价，驱动实时 RSI peek（不写入收盘指标）
-        tf = self._trading_tf()
-        if symbol in self.indicators and mark > 0:
-            self.indicators[symbol].set_live(tf, close=mark)
-
-        # 实时开仓/加仓（live RSI + live/收盘 VOL）
-        if symbol not in self._entry_busy:
-            self._entry_busy.add(symbol)
-            asyncio.create_task(
-                self._handle_realtime_entry(symbol),
-                name=f"rt-entry-mark-{symbol}",
-            )
-
-        # 持仓：实时 TP2（live RSI）+ 基准武装后 TP1/SL2（等待期也查 SL2）
-        if pos.is_flat:
+        if symbol in self._mark_busy:
             return
-        if not pos.baseline_armed and not pos.pending_baseline:
-            return
-        if symbol in self._mark_exit_busy:
-            return
-        self._mark_exit_busy.add(symbol)
+        self._mark_busy.add(symbol)
         asyncio.create_task(
-            self._handle_mark_exits(symbol, mark),
-            name=f"mark-exit-{symbol}",
+            self._handle_mark_logic(symbol, mark),
+            name=f"mark-logic-{symbol}",
         )
 
-    async def _handle_realtime_entry(self, symbol: str):
-        try:
-            async with self.locks.setdefault(symbol, asyncio.Lock()):
-                await self._evaluate_and_execute(
-                    symbol, trigger_interval=self._trading_tf(), mode="entry",
-                )
-        except Exception as e:
-            logger.exception("实时开仓检查失败 %s: %s", symbol, e)
-            await self._log("ERROR", symbol, f"实时开仓检查失败: {e}")
-        finally:
-            self._entry_busy.discard(symbol)
-
-    async def _handle_mark_exits(self, symbol: str, mark: float):
+    async def _handle_mark_logic(self, symbol: str, mark: float):
+        """实时盯价：回踩加仓（需已武装）+ 保本损（TP6 后武装）。"""
         try:
             async with self.locks.setdefault(symbol, asyncio.Lock()):
                 if not self._trading_ready():
                     return
-                pos = self.positions.get(symbol)
-                if not pos or pos.is_flat:
-                    return
-                if not pos.baseline_armed and not pos.pending_baseline:
-                    return
-                # 先 TP2（实时 RSI），再 TP1/SL2
+                legs = self.positions.get(symbol)
                 ind = self.indicators.get(symbol)
-                if ind is not None:
-                    tp2 = StrategyRules.check_tp2(
-                        self.cfg_strategy, ind, pos,
-                        trigger_interval=self._trading_tf(),
-                    )
-                    if tp2 is not None and tp2.type != "NONE":
-                        await self._execute_action(symbol, tp2)
-                        return
-                action = StrategyRules.check_price_exits(self.cfg_strategy, pos, mark)
-                if action is None or action.type == "NONE":
+                if not legs or ind is None:
                     return
-                await self._execute_action(symbol, action)
+                for direction in DIRECTIONS:
+                    pos = legs[direction]
+                    if pos.is_flat:
+                        continue
+                    params = self._params_for(pos)
+
+                    # 回踩加仓档（mark 实时判定，各档仅一次）
+                    if (
+                        self.allow_increase_for(symbol)
+                        and not pos.add_blocked
+                        and not pos.breakeven_armed
+                    ):
+                        act = StrategyRules.check_pullback(params, ind, pos, mark)
+                        if act is not None and act.type == "ADD":
+                            await self._execute_action(symbol, act, direction)
+
+                    # 保本损：mark 触及开仓均价 → 剩余全平
+                    if pos.breakeven_armed and pos.quantity > 0:
+                        hit = (
+                            mark <= pos.entry_price
+                            if direction == "LONG"
+                            else mark >= pos.entry_price
+                        )
+                        if hit:
+                            await self._do_close_leg(
+                                symbol, direction, "CLOSE_BREAKEVEN",
+                                reason=(
+                                    f"保本损: mark={mark:.6f} "
+                                    f"{'≤' if direction == 'LONG' else '≥'}"
+                                    f"均价={pos.entry_price:.6f}"
+                                ),
+                            )
         except Exception as e:
-            logger.exception("mark 退出检查失败 %s: %s", symbol, e)
-            await self._log("ERROR", symbol, f"实时退出检查失败: {e}")
+            logger.exception("mark 逻辑失败 %s: %s", symbol, e)
+            await self._log("ERROR", symbol, f"实时盯价失败: {e}")
         finally:
-            self._mark_exit_busy.discard(symbol)
+            self._mark_busy.discard(symbol)
 
     async def set_symbol_enabled(self, symbol: str, enabled: bool) -> None:
-        """运行中可热更新：禁用只禁开仓/加仓，已有仓位继续止盈止损。"""
+        """运行中可热更新：禁用只禁开仓/加仓，已有仓位继续止盈。"""
         symbol = (symbol or "").upper().strip()
         if not symbol:
             raise ValueError("币种为空")
@@ -1323,87 +1245,37 @@ class StrategyEngine:
         return bool(self.running and self.exchange is not None)
 
     # ---------------- 决策执行 ----------------
-    async def _evaluate_and_execute(self, symbol: str, trigger_interval: str = "1m",
-                                    mode: str = "all"):
-        if not self._trading_ready():
-            return
-        if symbol not in self.indicators or symbol not in self.positions:
-            return
-        epoch = self._run_epoch
-        ind = self.indicators[symbol]
-        pos = self.positions[symbol]
-        allow_open = self.allow_open_for(symbol)
-
-        action = StrategyRules.evaluate(
-            self.cfg_strategy, ind, pos,
-            allow_open=allow_open,
-            trigger_interval=trigger_interval,
-            mode=mode,
-        )
-        if action.type == "NONE":
-            return
-        if action.type == "ADD" and not self.allow_increase_for(symbol):
-            pos = self.positions.get(symbol)
-            why = []
-            cfg = self.cfg_symbols.get(symbol)
-            if cfg is not None and not cfg.enabled:
-                why.append("币种已禁开仓")
-            if pos is not None and pos.add_blocked:
-                why.append("接管仓禁补仓(add_blocked)")
-            await self._log(
-                "WARN", symbol,
-                f"加仓信号已触发但被拦截: {action.reason} | {';'.join(why) or 'allow_increase=false'}",
-            )
-            return
-        if not self._trading_ready() or epoch != self._run_epoch:
-            return
-
-        try:
-            await self._execute_action(symbol, action)
-        except Exception as e:
-            logger.exception("执行失败 %s %s: %s", symbol, action.type, e)
-            await self._log("ERROR", symbol, f"执行 {action.type} 失败: {e}")
-
-    async def _execute_action(self, symbol: str, action: Action):
+    async def _execute_action(self, symbol: str, action: Action,
+                              direction: Optional[str] = None):
         t = action.type
         if t == "OPEN_LONG":
             await self._do_open(symbol, "LONG", action.reason)
-            # 同刻若已满足更严的加仓条件（如 VOL 已达 10x 且 RSI 更深），立即补仓
-            await self._try_immediate_add(symbol)
         elif t == "OPEN_SHORT":
             await self._do_open(symbol, "SHORT", action.reason)
-            await self._try_immediate_add(symbol)
         elif t == "ADD":
-            await self._do_add(symbol, action.reason, action.trigger_key)
-        elif t in ("CLOSE_TP1", "CLOSE_TP2", "CLOSE_SL1", "CLOSE_SL2"):
-            await self._do_close(symbol, event=t, reason=action.reason)
-
-    async def _try_immediate_add(self, symbol: str):
-        """开仓成功后立刻再评估一级加仓，避免同根极端行情错过。"""
-        if not self._trading_ready():
-            return
-        if not self.allow_increase_for(symbol):
-            return
-        pos = self.positions.get(symbol)
-        ind = self.indicators.get(symbol)
-        if not pos or pos.is_flat or not ind:
-            return
-        action = StrategyRules.evaluate_entry(
-            self.cfg_strategy, ind, pos, allow_open=False,
-        )
-        if action.type != "ADD":
-            return
-        if not self.allow_increase_for(symbol):
-            return
-        try:
-            await self._do_add(symbol, action.reason, action.trigger_key)
-        except Exception as e:
-            logger.exception("开仓后立即加仓失败 %s: %s", symbol, e)
-            await self._log("ERROR", symbol, f"开仓后立即加仓失败: {e}")
+            if direction is None:
+                logger.error("ADD 缺少方向: %s", symbol)
+                return
+            await self._do_add(symbol, direction, action.reason, action.trigger_key)
+        elif t == "CLOSE_TP6":
+            if direction is None:
+                logger.error("CLOSE_TP6 缺少方向: %s", symbol)
+                return
+            await self._do_tp6(symbol, direction, action)
+        elif t.startswith("CLOSE_"):
+            if direction is None:
+                logger.error("%s 缺少方向: %s", t, symbol)
+                return
+            await self._do_close_leg(symbol, direction, event=t, reason=action.reason)
 
     async def _capital_available(self) -> float:
         """当前可开新单的可用保证金（交易所可用 / 本金扣除已占用）。"""
-        used = sum(p.margin for p in self.positions.values() if not p.is_flat)
+        used = sum(
+            p.margin
+            for legs in self.positions.values()
+            for p in legs.values()
+            if not p.is_flat
+        )
         if self.cfg_global.capital_source == "account" and self.exchange and self.exchange_api_key:
             try:
                 bal = await self.exchange.get_account_balance()
@@ -1414,38 +1286,6 @@ class StrategyEngine:
                 logger.warning("拉账户余额失败: %s", e)
         return max(0.0, self.cfg_global.capital_usdt - used)
 
-    async def _sizing_capital_base(self) -> float:
-        """
-        仓位比例的计算基数（本金/权益），不因本策略已开仓而缩小。
-        开仓+加仓1+加仓2 各 2% → 合计约 6% 本金。
-        """
-        used = sum(p.margin for p in self.positions.values() if not p.is_flat)
-        if self.cfg_global.capital_source == "account" and self.exchange and self.exchange_api_key:
-            try:
-                avail = float(await self.exchange.get_account_balance())
-                # 权益近似 = 可用 + 本策略已占用保证金
-                return max(0.0, avail + used)
-            except Exception as e:
-                logger.warning("拉账户余额失败: %s", e)
-        return max(0.0, float(self.cfg_global.capital_usdt or 0))
-
-    async def _order_margin_budget(self, symbol: str, *, for_add: bool = False) -> float:
-        """每笔开/加仓保证金 = 本金基数 × 仓位%；再与当前可用取小，避免超额下单。"""
-        base = await self._sizing_capital_base()
-        pct = max(0.0, float(self.cfg_strategy.position_pct)) / 100.0
-        budget = max(0.0, base) * pct
-        avail = await self._capital_available()
-        if avail > 0:
-            budget = min(budget, avail)
-        # 加仓时若可用被挤占导致过小，回退到与首仓单笔同额（累计保证金/已开档位数）
-        if for_add:
-            pos = self.positions.get(symbol)
-            if pos is not None and not pos.is_flat and pos.margin > 0:
-                legs = max(1, int(pos.add_count) + 1)
-                unit = float(pos.margin) / legs
-                if budget < unit * 0.8:
-                    budget = min(unit, avail) if avail > 0 else unit
-        return max(0.0, budget)
     async def query_account_balance(self) -> dict:
         await self.load_exchange_settings()
         if not self.exchange_api_key or not self.exchange_api_secret:
@@ -1474,7 +1314,7 @@ class StrategyEngine:
                 pass
 
     async def _effective_leverage(self, symbol: str) -> int:
-        default = int(self.cfg_strategy.leverage or 20)
+        default = int(self.cfg_strategy.leverage or 10)
         if self.cfg_strategy.leverage_mode == "follow" and self.exchange:
             try:
                 return await self.exchange.get_symbol_leverage(symbol, default=default)
@@ -1495,26 +1335,34 @@ class StrategyEngine:
     async def _do_open(self, symbol: str, direction: str, reason: str):
         if not self._trading_ready():
             return
-        pos = self.positions[symbol]
+        pos = self.positions[symbol][direction]
         if not pos.is_flat:
             return
+        plan = self.cfg_strategy.order_plan
+        margin = float(plan.order_margin_usdt)
+        avail = await self._capital_available()
+        if avail < margin:
+            await self._log(
+                "WARN", symbol,
+                f"开仓跳过: 可用保证金 {avail:.4f} < 每单 {margin:.4f}",
+            )
+            return
         await self._ensure_symbol_leverage(symbol)
-        margin = await self._order_margin_budget(symbol, for_add=False)
         qty, mark = await self._calc_order_qty(symbol, margin)
 
         if qty < self.exchange.min_qty(symbol):
             await self._log(
                 "WARN", symbol,
                 f"开仓跳过: 数量 {qty} < 最小 {self.exchange.min_qty(symbol)} "
-                f"(本单保证金≈{margin:.4f})",
+                f"(保证金={margin:g}u)",
             )
             return
         if qty * mark < self.exchange.min_notional(symbol):
             await self._log(
                 "WARN", symbol,
-                f"开仓跳过: 名义≈{qty * mark:.2f} < 最小 "
+                f"开仓跳过: 名义≈{qty * mark:.2f} < 最小名义 "
                 f"{self.exchange.min_notional(symbol):.2f} "
-                f"(本单保证金≈{margin:.4f})",
+                f"(保证金={margin:g}u×杠杆，需调大 order_margin_usdt 或杠杆)",
             )
             return
 
@@ -1535,11 +1383,14 @@ class StrategyEngine:
             fill_qty = qty
         if fill_qty <= 0:
             fill_qty = qty
-        # SL2 必须用真实占用保证金 = 名义/杠杆，不能用「资金×仓位%」预算值
         actual_margin = await self._margin_for_qty(symbol, fill_qty, fill_price)
         if actual_margin <= 0:
             actual_margin = margin
-        pos.open(direction, fill_qty, fill_price, actual_margin)  # pending_baseline=True
+        # 规则2：开仓时快照当前策略参数
+        pos.open(
+            direction, fill_qty, fill_price, actual_margin,
+            params_snapshot=self.cfg_strategy.model_dump(),
+        )
         await self._persist_position(symbol)
         await self._record_trade(
             symbol, side, direction, "OPEN", fill_qty, fill_price, actual_margin, coid, order,
@@ -1547,56 +1398,51 @@ class StrategyEngine:
         await self._log(
             "INFO", symbol,
             f"[开仓 {direction}] qty={fill_qty} @ {fill_price:.6f} "
-            f"margin≈{actual_margin:.4f}(预算{margin:.4f}) | {reason}",
+            f"margin≈{actual_margin:.4f} | {reason}",
         )
 
-    async def _do_add(self, symbol: str, reason: str, trigger_key: str):
+    async def _do_add(self, symbol: str, direction: str, reason: str, trigger_key: str):
         if not self._trading_ready():
             return
-        pos = self.positions[symbol]
-        if pos.is_flat or pos.add_blocked or pos.add_count >= 2:
+        pos = self.positions[symbol][direction]
+        if pos.is_flat or pos.add_blocked:
             await self._log(
                 "WARN", symbol,
-                f"加仓跳过: flat={pos.is_flat} blocked={pos.add_blocked} "
-                f"add_count={pos.add_count} | {reason}",
+                f"加仓跳过: flat={pos.is_flat} blocked={pos.add_blocked} | {reason}",
+            )
+            return
+        if pos.is_leg_fired(trigger_key):
+            return
+        margin = self._order_margin_for(pos)
+        avail = await self._capital_available()
+        if avail < margin:
+            await self._log(
+                "WARN", symbol,
+                f"加仓跳过: 可用保证金 {avail:.4f} < 每单 {margin:.4f} | {reason}",
             )
             return
         await self._ensure_symbol_leverage(symbol)
-        margin = await self._order_margin_budget(symbol, for_add=True)
         qty, mark = await self._calc_order_qty(symbol, margin)
-        # 预算过小达不到最小名义时，强制按当前仓保证金再试一次
-        if (
-            (qty < self.exchange.min_qty(symbol) or qty * mark < self.exchange.min_notional(symbol))
-            and pos.margin > 0
-            and abs(margin - pos.margin) > 1e-8
-        ):
-            await self._log(
-                "INFO", symbol,
-                f"加仓预算过小(保证金≈{margin:.4f})，改用与现仓同额 {pos.margin:.4f}",
-            )
-            margin = float(pos.margin)
-            qty, mark = await self._calc_order_qty(symbol, margin)
         if qty < self.exchange.min_qty(symbol):
             await self._log(
                 "WARN", symbol,
                 f"加仓跳过: 数量 {qty} < 最小 {self.exchange.min_qty(symbol)} "
-                f"(本单保证金≈{margin:.4f}) | {reason}",
+                f"(保证金={margin:g}u) | {reason}",
             )
             return
         if qty * mark < self.exchange.min_notional(symbol):
             await self._log(
                 "WARN", symbol,
-                f"加仓跳过: 名义≈{qty * mark:.2f} < 最小 "
-                f"{self.exchange.min_notional(symbol):.2f} "
-                f"(本单保证金≈{margin:.4f}) | {reason}",
+                f"加仓跳过: 名义≈{qty * mark:.2f} < 最小名义 "
+                f"{self.exchange.min_notional(symbol):.2f} (保证金={margin:g}u) | {reason}",
             )
             return
         if not self._trading_ready():
             return
-        side = "BUY" if pos.direction == "LONG" else "SELL"
+        side = "BUY" if direction == "LONG" else "SELL"
         coid = self.exchange.gen_client_order_id(prefix=f"add-{symbol.lower()[:8]}")
         order = await self.exchange.market_order(
-            symbol, side=side, position_side=pos.direction,
+            symbol, side=side, position_side=direction,
             quantity=qty, client_order_id=coid,
         )
         fill_price = float(order.get("avgPrice") or mark)
@@ -1611,26 +1457,73 @@ class StrategyEngine:
         actual_margin = await self._margin_for_qty(symbol, fill_qty, fill_price)
         if actual_margin <= 0:
             actual_margin = margin
-        pos.add(fill_qty, fill_price, actual_margin, trigger_key)  # pending_baseline reset
+        pos.add(fill_qty, fill_price, actual_margin, trigger_key)
         await self._persist_position(symbol)
         await self._record_trade(
-            symbol, side, pos.direction, "ADD", fill_qty, fill_price, actual_margin, coid, order,
+            symbol, side, direction, "ADD", fill_qty, fill_price, actual_margin, coid, order,
         )
         await self._log(
             "INFO", symbol,
-            f"[加仓{pos.add_count}] qty={fill_qty} @ {fill_price:.6f} "
-            f"margin≈{actual_margin:.4f} | {reason}",
+            f"[加仓 {direction}/{trigger_key}] qty={fill_qty} @ {fill_price:.6f} "
+            f"margin≈{actual_margin:.4f} 累计{pos.orders_count}单 | {reason}",
         )
 
-    async def _do_close(self, symbol: str, event: str, reason: str):
+    async def _do_tp6(self, symbol: str, direction: str, action: Action):
+        """TP6 分批：标记该档已触发并武装保本损，再减仓。"""
+        if not self._trading_ready():
+            return
+        pos = self.positions[symbol][direction]
+        if pos.is_flat or pos.is_tp6_fired(action.trigger_key):
+            return
+        # 先标记（防重复触发），再下单
+        pos.fire_tp6(action.trigger_key)
+        await self._persist_position(symbol)
+        await self._log("INFO", symbol, f"[TP6 触发] {direction}/{action.trigger_key} 保本损已武装")
+
+        pct = float(action.close_pct)
+        close_qty = pos.quantity * (pct / 100.0)
+        remaining = pos.quantity - close_qty
+        if remaining < self.exchange.min_qty(symbol):
+            # 剩余过小 → 全平
+            await self._do_close_leg(
+                symbol, direction, event="CLOSE_TP6", reason=action.reason,
+            )
+            return
+
+        coid = self.exchange.gen_client_order_id(prefix=f"tp6-{symbol.lower()[:8]}")
+        order = await self.exchange.close_position(
+            symbol, direction=direction, quantity=close_qty, client_order_id=coid,
+        )
+        fill_price = float(order.get("avgPrice") or pos.mark_price or pos.entry_price)
+        if fill_price <= 0:
+            fill_price = pos.entry_price
+        if direction == "LONG":
+            pnl = (fill_price - pos.entry_price) * close_qty
+        else:
+            pnl = (pos.entry_price - fill_price) * close_qty
+        side = "SELL" if direction == "LONG" else "BUY"
+        await self._record_trade(
+            symbol, side, direction, "CLOSE_TP6", close_qty, fill_price,
+            pos.margin * (pct / 100.0), coid, order, realized_pnl=pnl,
+        )
+        pos.partial_close(pct)
+        await self._persist_position(symbol)
+        await self._log(
+            "INFO", symbol,
+            f"[TP6 分批 {direction}] 平{pct:g}% qty={close_qty} @ {fill_price:.6f} "
+            f"pnl={pnl:.2f} 剩余qty={pos.quantity:.8f} | {action.reason}",
+        )
+
+    async def _do_close_leg(self, symbol: str, direction: str, event: str,
+                            reason: str):
         if not self.exchange or not self.running:
             return
-        pos = self.positions[symbol]
+        pos = self.positions[symbol][direction]
         if pos.is_flat:
             return
         if event not in CLOSE_EVENTS and not event.startswith("CLOSE_"):
             event = "CLOSE_MANUAL"
-        qty, direction = pos.quantity, pos.direction
+        qty = pos.quantity
         coid = self.exchange.gen_client_order_id(prefix=f"close-{symbol.lower()[:8]}")
         order = await self.exchange.close_position(
             symbol, direction=direction, quantity=qty, client_order_id=coid,
@@ -1642,27 +1535,35 @@ class StrategyEngine:
             symbol, side, direction, event, qty, fill_price,
             pos.margin, coid, order, realized_pnl=pnl,
         )
-        await self._log("INFO", symbol, f"[{event}] qty={qty} pnl={pnl:.2f} | {reason}")
+        await self._log("INFO", symbol, f"[{event} {direction}] qty={qty} pnl={pnl:.2f} | {reason}")
         pos.close()
         await self._persist_position(symbol)
 
     async def close_all_positions(self, reason: str = "一键平仓") -> dict:
-        """平掉内存中全部非空仓位。"""
+        """平掉内存中全部非空仓位（含双向腿）。"""
         if not self.exchange:
             raise RuntimeError("交易所未初始化")
         closed: list[str] = []
         errors: list[str] = []
-        symbols = [s for s, p in self.positions.items() if not p.is_flat]
-        for sym in symbols:
+        pairs = [
+            (sym, d)
+            for sym, legs in self.positions.items()
+            for d, p in legs.items()
+            if not p.is_flat
+        ]
+        for sym, direction in pairs:
             try:
                 async with self.locks.setdefault(sym, asyncio.Lock()):
-                    if self.positions[sym].is_flat:
+                    pos = self.positions.get(sym, {}).get(direction)
+                    if pos is None or pos.is_flat:
                         continue
-                    await self._do_close(sym, event="CLOSE_MANUAL", reason=reason)
-                    closed.append(sym)
+                    await self._do_close_leg(
+                        sym, direction, event="CLOSE_MANUAL", reason=reason,
+                    )
+                    closed.append(f"{sym}:{direction}")
             except Exception as e:
-                logger.exception("一键平仓失败 %s: %s", sym, e)
-                errors.append(f"{sym}: {e}")
+                logger.exception("一键平仓失败 %s %s: %s", sym, direction, e)
+                errors.append(f"{sym}:{direction}: {e}")
         self.bus.publish({"type": "runtime", "data": self.runtime_snapshot()})
         return {"closed": closed, "errors": errors, "count": len(closed)}
 
@@ -1670,10 +1571,7 @@ class StrategyEngine:
                             margin, coid, raw, realized_pnl: float = 0.0):
         # 成交展示用真实下单时刻；K 线收盘时刻仅作元数据，避免全部显示成整点
         now_cn = datetime.now(TZ_CN)
-        bar_ts = self._bar_close_ts.get(symbol)
         raw_out = dict(raw or {})
-        if bar_ts is not None:
-            raw_out["kline_close_ts"] = bar_ts.isoformat(timespec="seconds")
         raw_out["wall_ts"] = now_cn.isoformat(timespec="seconds")
         async with AsyncSessionLocal() as db:
             db.add(Trade(
@@ -1704,7 +1602,7 @@ class StrategyEngine:
             "running": self.running,
             "booting": self.booting,
             "started_at": self.started_at.isoformat() if self.started_at else None,
-            "timeframe": self._trading_tf(),
+            "timeframe": SIGNAL_TIMEFRAME,
             "leverage_mode": self.cfg_strategy.leverage_mode,
             "screener": {
                 "last_at": self._last_screen_at.isoformat() if self._last_screen_at else None,
@@ -1715,11 +1613,44 @@ class StrategyEngine:
         }
 
     def _symbol_runtime(self, s: str) -> dict:
-        if s not in self.positions or s not in self.indicators:
-            return {"symbol": s, "direction": "FLAT", "enabled": False, "indicators": {}}
-        mark = self.positions[s].mark_price or None
+        legs = self.positions.get(s)
+        if legs is None or s not in self.indicators:
+            return {"symbol": s, "direction": "FLAT", "enabled": False,
+                    "legs": [], "indicators": {}}
+        leg_views = []
+        total_pnl = 0.0
+        total_margin = 0.0
+        for d in DIRECTIONS:
+            pos = legs[d]
+            if pos.is_flat:
+                continue
+            snap = pos.snapshot()
+            leg_views.append({
+                "direction": d,
+                "entry_price": snap["entry_price"],
+                "quantity": snap["quantity"],
+                "margin_used": snap["margin"],
+                "unrealized_pnl": snap["unrealized_pnl"],
+                "orders_count": snap["orders_count"],
+                "tp6_fired": bool(snap["tp6_fired"]),
+                "breakeven_armed": snap["breakeven_armed"],
+                "legs_fired": snap["legs_fired"],
+                "opened_at": snap["opened_at"],
+            })
+            total_pnl += snap["unrealized_pnl"]
+            total_margin += snap["margin"]
+        mark = max((legs[d].mark_price for d in DIRECTIONS), default=0.0)
+        first = leg_views[0] if leg_views else None
         return {
-            **self.positions[s].snapshot(),
+            "symbol": s,
             "enabled": self.cfg_symbols.get(s, SymbolConfig(symbol=s)).enabled,
-            "indicators": self.indicators[s].snapshot(latest_price=mark),
+            # 兼容旧前端单腿展示；双腿时 legs 数组为准
+            "direction": first["direction"] if first else "FLAT",
+            "entry_price": first["entry_price"] if first else 0.0,
+            "quantity": first["quantity"] if first else 0.0,
+            "margin_used": total_margin,
+            "unrealized_pnl": total_pnl,
+            "mark_price": mark,
+            "legs": leg_views,
+            "indicators": self.indicators[s].snapshot(latest_price=mark or None),
         }

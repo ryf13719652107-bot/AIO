@@ -1,16 +1,22 @@
 """
-单币种仓位状态机。
-- 首仓 + 两级顺序加仓（各最多一次）
-- 开/加仓后等待下一根 1m K 收盘武装退出基准（TP1/SL2）
-- SL2 在等待武装期间同样生效
+单币种单方向仓位状态机（双向持仓的一腿）。
+
+- 首仓 + 5 个加仓档（ema7/ema25/ema99 回踩 + t15m/t30m 趋势），各档仅一次
+- 回踩档武装状态（先站上 EMA 再回踩才触发）
+- TP6 分批止盈（各档仅一次），任一档触发后武装保本损
+- 开仓时快照 StrategyParams，旧仓按快照策略管理
 """
 
-import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Literal, Optional
 
 Direction = Literal["FLAT", "LONG", "SHORT"]
+
+# 加仓档触发 key
+LEG_FIRST = "first"
+LEG_KEYS = ("ema7", "ema25", "ema99", "t15m", "t30m")
+TP6_KEYS = ("t5m", "t15m", "t30m", "t60m", "t60m_120m")
 
 
 @dataclass
@@ -19,23 +25,18 @@ class SymbolPosition:
     direction: Direction = "FLAT"
 
     quantity: float = 0.0
-    entry_price: float = 0.0
-    margin: float = 0.0
+    entry_price: float = 0.0      # 加权开仓均价（保本损基准）
+    margin: float = 0.0           # 累计保证金
     opened_at: Optional[datetime] = None
     mark_price: float = 0.0
 
-    # 加仓：0=未加，1=已加一级，2=已加二级（或接管仓禁止再加）
-    add_count: int = 0
-    add_blocked: bool = False  # 交易所接管仓：禁止加仓
-
-    # 退出基准
-    pending_baseline: bool = False      # 等待下一根 1m K 收盘开始 TP1
-    pending_baseline_since_ms: int = 0  # 开始等待的时刻（ms）
-    baseline_armed: bool = False
-    baseline_price: float = 0.0         # 武装时参考价（1m 收盘价）
-    baseline_pnl: float = 0.0           # 武装时浮盈（可≤0）；展示用
-    baseline_open_ms: int = 0           # 武装所用 1m K 的 open_ms
-    peak_pnl: float = 0.0               # 兼容字段（展示/持久化；退出逻辑不再使用）
+    orders_count: int = 0                        # 已开单数（含首仓）
+    legs_fired: set = field(default_factory=set)  # 已触发档 key
+    pullback_armed: dict = field(default_factory=dict)  # key→bool 回踩武装
+    tp6_fired: set = field(default_factory=set)   # 已触发 TP6 档 key
+    breakeven_armed: bool = False                 # 保本损武装（TP6 触发后）
+    params_snapshot: dict = field(default_factory=dict)  # 开仓时策略参数快照
+    add_blocked: bool = False                     # 接管仓：禁止加仓
 
     @property
     def is_flat(self) -> bool:
@@ -45,28 +46,20 @@ class SymbolPosition:
     def avg_price(self) -> float:
         return self.entry_price
 
-    @property
-    def add_fired(self) -> bool:
-        """兼容旧代码：是否至少加过一次。"""
-        return self.add_count >= 1
+    def is_leg_fired(self, key: str) -> bool:
+        return key in self.legs_fired
 
-    @property
-    def add_conditions_fired(self) -> set[str]:
-        keys = set()
-        if self.add_count >= 1:
-            keys.add("add1")
-        if self.add_count >= 2:
-            keys.add("add2")
-        return keys
+    def mark_leg_fired(self, key: str):
+        self.legs_fired.add(key)
 
-    def can_add_level(self, level: int) -> bool:
-        if self.is_flat or self.add_blocked:
-            return False
-        if level == 1:
-            return self.add_count == 0
-        if level == 2:
-            return self.add_count == 1
-        return False
+    def get_pullback_armed(self, key: str) -> bool:
+        return bool(self.pullback_armed.get(key, False))
+
+    def set_pullback_armed(self, key: str, armed: bool):
+        self.pullback_armed[key] = armed
+
+    def is_tp6_fired(self, key: str) -> bool:
+        return key in self.tp6_fired
 
     def unrealized_pnl(self, mark: Optional[float] = None) -> float:
         if self.is_flat:
@@ -83,90 +76,70 @@ class SymbolPosition:
             return 0.0
         return self.unrealized_pnl(mark) / self.margin
 
-    def _reset_baseline_wait(self, since_ms: Optional[int] = None):
-        self.pending_baseline = True
-        self.pending_baseline_since_ms = int(
-            since_ms if since_ms is not None else time.time() * 1000
-        )
-        self.baseline_armed = False
-        self.baseline_price = 0.0
-        self.baseline_pnl = 0.0
-        self.baseline_open_ms = 0
-        self.peak_pnl = 0.0
-
     def open(self, side: Direction, quantity: float, price: float, margin: float,
-             *, since_ms: Optional[int] = None):
-        assert self.direction == "FLAT", "已有持仓不能开新仓"
+             params_snapshot: Optional[dict] = None, leg_key: str = LEG_FIRST):
+        assert self.direction == "FLAT", "该方向已有持仓"
         self.direction = side
         self.quantity = quantity
         self.entry_price = price
         self.margin = margin
         self.opened_at = datetime.utcnow()
-        self.add_count = 0
-        self.add_blocked = False
+        self.orders_count = 1
         self.mark_price = price
-        self._reset_baseline_wait(since_ms)
+        self.params_snapshot = params_snapshot or {}
+        self.legs_fired = {leg_key}
+        self.pullback_armed = {}
+        self.tp6_fired = set()
+        self.breakeven_armed = False
 
-    def add(self, quantity: float, price: float, margin: float, trigger_key: str = "",
-            *, since_ms: Optional[int] = None):
-        """加仓：更新加权均价与累计保证金，并重置退出基准等待。"""
+    def add(self, quantity: float, price: float, margin: float, leg_key: str):
+        """加仓：更新加权均价与累计保证金，标记该档已触发。"""
         if self.is_flat or self.add_blocked:
             return
-        if self.add_count >= 2:
+        if leg_key in self.legs_fired:
             return
         total_qty = self.quantity + quantity
         if total_qty <= 0:
             return
-        self.entry_price = (self.entry_price * self.quantity + price * quantity) / total_qty
+        self.entry_price = (
+            (self.entry_price * self.quantity + price * quantity) / total_qty
+        )
         self.quantity = total_qty
         self.margin += margin
-        self.add_count = min(2, self.add_count + 1)
-        self._reset_baseline_wait(since_ms)
+        self.orders_count += 1
+        self.mark_leg_fired(leg_key)
+
+    def partial_close(self, pct: float) -> float:
+        """TP6 分批：按 pct% 减仓（数量与保证金等比例缩减）。返回减仓数量。"""
+        if self.is_flat or pct <= 0:
+            return 0.0
+        pct = min(pct, 100.0)
+        qty = self.quantity * (pct / 100.0)
+        self.quantity = max(0.0, self.quantity - qty)
+        self.margin = max(0.0, self.margin * (1.0 - pct / 100.0))
+        return qty
 
     def adopt(self, side: Direction, quantity: float, price: float, margin: float,
-              *, block_add: bool = True, since_ms: Optional[int] = None):
-        """接管交易所已有仓：禁止加仓，等待下一根 1m K 收盘建立基准。"""
+              *, block_add: bool = True, params_snapshot: Optional[dict] = None):
+        """接管交易所已有仓：默认禁止加仓（无档位记录），TP 正常执行。"""
         self.direction = side
         self.quantity = quantity
         self.entry_price = price
         self.margin = margin
         self.opened_at = self.opened_at or datetime.utcnow()
         self.mark_price = price
-        self.add_count = 2 if block_add else self.add_count
+        self.orders_count = 1
+        self.legs_fired = set(LEG_KEYS) | {LEG_FIRST}  # 视为全部档已用
+        self.pullback_armed = {}
+        self.tp6_fired = set()
+        self.breakeven_armed = False
         self.add_blocked = block_add
-        self._reset_baseline_wait(since_ms)
+        if params_snapshot:
+            self.params_snapshot = params_snapshot
 
-    def arm_baseline(self, ref_price: float, open_ms: int = 0,
-                     *, close_boundary_ms: int = 0) -> bool:
-        """下一根 1m K 收盘后武装退出基准。"""
-        if self.is_flat or not self.pending_baseline:
-            return False
-        # 必须是进入等待之后的收盘，避免开仓当根立刻武装
-        if close_boundary_ms and self.pending_baseline_since_ms:
-            if close_boundary_ms <= self.pending_baseline_since_ms:
-                return False
-        self.mark_price = ref_price
-        self.baseline_price = ref_price
-        pnl = self.unrealized_pnl(ref_price)
-        self.baseline_pnl = pnl
-        # 兼容保留 peak_pnl（退出逻辑已不再依赖）
-        self.peak_pnl = max(0.0, pnl)
-        self.baseline_open_ms = open_ms
-        self.baseline_armed = True
-        self.pending_baseline = False
-        self.pending_baseline_since_ms = 0
-        return True
-
-    def ratchet_peak(self, mark: float) -> float:
-        """武装后上移峰值浮盈；返回当前峰值。"""
-        if self.is_flat or not self.baseline_armed or mark <= 0:
-            return self.peak_pnl
-        self.mark_price = mark
-        pnl = self.unrealized_pnl(mark)
-        if pnl > self.peak_pnl:
-            self.peak_pnl = pnl
-            self.baseline_price = mark
-        return self.peak_pnl
+    def fire_tp6(self, key: str):
+        self.tp6_fired.add(key)
+        self.breakeven_armed = True
 
     def close(self):
         self.direction = "FLAT"
@@ -174,15 +147,13 @@ class SymbolPosition:
         self.entry_price = 0.0
         self.margin = 0.0
         self.opened_at = None
-        self.add_count = 0
+        self.orders_count = 0
+        self.legs_fired = set()
+        self.pullback_armed = {}
+        self.tp6_fired = set()
+        self.breakeven_armed = False
+        self.params_snapshot = {}
         self.add_blocked = False
-        self.pending_baseline = False
-        self.pending_baseline_since_ms = 0
-        self.baseline_armed = False
-        self.baseline_price = 0.0
-        self.baseline_pnl = 0.0
-        self.baseline_open_ms = 0
-        self.peak_pnl = 0.0
 
     def to_dict(self) -> dict:
         return {
@@ -192,63 +163,53 @@ class SymbolPosition:
             "entry_price": self.entry_price,
             "margin": self.margin,
             "opened_at_iso": self.opened_at.isoformat() if self.opened_at else None,
-            "add_count": self.add_count,
+            "orders_count": self.orders_count,
+            "legs_fired": sorted(self.legs_fired),
+            "pullback_armed": {k: bool(v) for k, v in self.pullback_armed.items()},
+            "tp6_fired": sorted(self.tp6_fired),
+            "breakeven_armed": self.breakeven_armed,
+            "params_snapshot": self.params_snapshot,
             "add_blocked": self.add_blocked,
-            "pending_baseline": self.pending_baseline,
-            "pending_baseline_since_ms": self.pending_baseline_since_ms,
-            "baseline_armed": self.baseline_armed,
-            "baseline_price": self.baseline_price,
-            "baseline_pnl": self.baseline_pnl,
-            "baseline_open_ms": self.baseline_open_ms,
-            "peak_pnl": self.peak_pnl,
             "mark_price": self.mark_price,
         }
 
     @classmethod
     def from_dict(cls, d: dict) -> "SymbolPosition":
-        pos = cls(symbol=d["symbol"])
+        pos = cls(symbol=d.get("symbol", ""))
         pos.direction = d.get("direction", "FLAT")
-        pos.quantity = float(d.get("quantity", 0))
-        pos.entry_price = float(d.get("entry_price", 0))
-        pos.margin = float(d.get("margin", 0))
-        oa = d.get("opened_at_iso")
-        if oa:
-            pos.opened_at = datetime.fromisoformat(oa)
-        if "add_count" in d:
-            pos.add_count = int(d.get("add_count", 0))
-        elif d.get("add_fired"):
-            pos.add_count = 1
+        pos.quantity = float(d.get("quantity", 0.0))
+        pos.entry_price = float(d.get("entry_price", 0.0))
+        pos.margin = float(d.get("margin", 0.0))
+        iso = d.get("opened_at_iso")
+        try:
+            pos.opened_at = datetime.fromisoformat(iso) if iso else None
+        except (ValueError, TypeError):
+            pos.opened_at = None
+        pos.orders_count = int(d.get("orders_count", 0))
+        pos.legs_fired = set(d.get("legs_fired") or ())
+        pos.pullback_armed = dict(d.get("pullback_armed") or {})
+        pos.tp6_fired = set(d.get("tp6_fired") or ())
+        pos.breakeven_armed = bool(d.get("breakeven_armed", False))
+        pos.params_snapshot = dict(d.get("params_snapshot") or {})
         pos.add_blocked = bool(d.get("add_blocked", False))
-        pos.pending_baseline = bool(d.get("pending_baseline", False))
-        pos.pending_baseline_since_ms = int(d.get("pending_baseline_since_ms", 0) or 0)
-        pos.baseline_armed = bool(d.get("baseline_armed", False))
-        pos.baseline_price = float(d.get("baseline_price", 0) or 0)
-        pos.baseline_pnl = float(d.get("baseline_pnl", 0) or 0)
-        pos.baseline_open_ms = int(d.get("baseline_open_ms", 0) or 0)
-        # 兼容旧状态：无 peak 时用 max(0, baseline_pnl)
-        if "peak_pnl" in d:
-            pos.peak_pnl = float(d.get("peak_pnl", 0) or 0)
-        else:
-            pos.peak_pnl = max(0.0, pos.baseline_pnl) if pos.baseline_armed else 0.0
-        pos.mark_price = float(d.get("mark_price", 0) or 0)
+        pos.mark_price = float(d.get("mark_price", 0.0))
         return pos
 
-    def snapshot(self) -> dict:
+    def snapshot(self, mark: Optional[float] = None) -> dict:
+        m = mark if mark is not None else self.mark_price
         return {
-            "symbol": self.symbol,
             "direction": self.direction,
             "entry_price": self.entry_price,
             "quantity": self.quantity,
+            "margin": self.margin,
             "margin_used": self.margin,
-            "add_count": self.add_count,
-            "add_fired": self.add_count >= 1,
-            "add_blocked": self.add_blocked,
-            "pending_baseline": self.pending_baseline,
-            "baseline_armed": self.baseline_armed,
-            "baseline_price": self.baseline_price,
-            "baseline_pnl": self.baseline_pnl,
-            "peak_pnl": self.peak_pnl,
-            "unrealized_pnl": self.unrealized_pnl(),
-            "unrealized_pnl_ratio": self.unrealized_pnl_ratio(),
-            "mark_price": self.mark_price,
+            "opened_at": self.opened_at.isoformat() if self.opened_at else None,
+            "orders_count": self.orders_count,
+            "legs_fired": sorted(self.legs_fired),
+            "pullback_armed": {k: bool(v) for k, v in self.pullback_armed.items()},
+            "tp6_fired": sorted(self.tp6_fired),
+            "breakeven_armed": self.breakeven_armed,
+            "unrealized_pnl": self.unrealized_pnl(m),
+            "unrealized_pnl_ratio": self.unrealized_pnl_ratio(m),
+            "mark_price": m,
         }

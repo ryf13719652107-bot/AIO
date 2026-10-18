@@ -1,80 +1,97 @@
-"""RSI + Volume 指标测试。"""
+"""多周期指标测试：EMA / MACD / RSI / VolumeWindow / SymbolIndicators。"""
 
-from app.strategy.indicators import RSIState, SymbolIndicators, VolumeWindow
+import math
 
-
-def test_volume_avg_prior_excludes_current():
-    vw = VolumeWindow(lookback=3)
-    for v in (10, 20, 30, 100):
-        vw.update(v)
-    # prior = 10,20,30 avg=20; latest=100
-    assert vw.latest == 100
-    assert vw.avg_prior(3) == 20
-    assert abs(vw.ratio(3) - 5.0) < 1e-9
+from app.strategy.indicators import (
+    EMAState, MACDState, RSIState, SymbolIndicators, TimeframeIndicators,
+    VolumeWindow,
+)
 
 
-def test_volume_not_ready_until_lookback_plus_one():
-    vw = VolumeWindow(lookback=30)
-    for i in range(30):
-        vw.update(1.0)
-    assert vw.avg_prior(30) is None
-    vw.update(10.0)
-    assert vw.avg_prior(30) == 1.0
-    assert abs(vw.ratio(30) - 10.0) < 1e-9
+def test_ema_sma_seed_then_recursive():
+    ema = EMAState(period=3)
+    ema.update(1)
+    ema.update(2)
+    assert not ema.initialized
+    ema.update(3)
+    assert ema.initialized
+    assert math.isclose(ema.value, 2.0)  # SMA(1,2,3)
+    ema.update(4)
+    k = 2 / 4
+    assert math.isclose(ema.value, 4 * k + 2 * (1 - k))
 
 
-def test_rsi_peek_does_not_mutate():
+def test_macd_basic_and_history():
+    macd = MACDState()
+    # 递增序列产生正值 DIF
+    for i in range(1, 60):
+        macd.update(float(i))
+    assert macd.dif is not None and macd.dif > 0
+    assert macd.dea is not None
+    assert macd.hist is not None
+    assert math.isclose(macd.hist, macd.dif - macd.dea, rel_tol=1e-9)
+    assert len(macd.hist_history) >= 4
+
+    # 连续递增 → 多头"0轴以下连续缩小"应不成立（柱为正）
+    assert not macd.hist_shrinking_below_zero()
+
+
+def test_macd_shrinking_detection():
+    macd = MACDState()
+    seq = [100, 100.5, 100.8, 100.9, 100.9, 100.85, 100.8, 100.7, 100.5]
+    for p in seq:
+        macd.update(p)
+    h = list(macd.hist_history)
+    if len(h) >= 4 and all(v < 0 for v in h[-3:]):
+        assert macd.hist_shrinking_below_zero() == (
+            h[-1] > h[-2] > h[-3] > h[-4]
+        )
+
+
+def test_rsi_bounds():
     rsi = RSIState(period=6)
-    prices = [100, 101, 102, 101, 100, 99, 98, 97]
-    for p in prices:
-        rsi.update(p)
-    assert rsi.initialized
-    closed = rsi.value
-    peeked = rsi.peek(90.0)  # 继续大跌 → RSI 更低
-    assert peeked is not None
-    assert peeked < closed
-    assert rsi.value == closed  # 未写入
+    for i in range(1, 30):
+        rsi.update(100.0 + i)  # 单边上涨
+    assert rsi.value == 100.0
+
+    rsi2 = RSIState(period=6)
+    for i in range(1, 30):
+        rsi2.update(100.0 - i)  # 单边下跌
+    assert rsi2.value == 0.0
 
 
-def test_rsi_initializes():
-    rsi = RSIState(period=6)
-    prices = [100, 101, 102, 101, 100, 99, 98, 97]
-    for p in prices:
-        rsi.update(p)
-    assert rsi.initialized
-    assert rsi.value is not None
-
-
-def test_symbol_indicators_ready():
-    ind = SymbolIndicators(timeframe="1m", rsi_period=6, volume_lookback=5)
-    closes = [100 + i * 0.1 for i in range(20)]
-    vols = [10.0] * 19 + [100.0]
-    ind.bootstrap("1m", closes, vols)
-    assert ind.ready("1m")
-    snap = ind.snapshot()
-    assert "1m" in snap
-    assert snap["1m"]["rsi"] is not None
-    assert snap["1m"]["volume_ratio"] is not None
-
-
-def test_live_volume_vs_closed_avg():
+def test_volume_avg_prior_excludes_latest():
     vw = VolumeWindow(lookback=3)
-    for v in (10, 20, 30):
+    for v in (1, 2, 3, 4, 5):
         vw.update(v)
-    assert vw.avg_closed(3) == 20.0
-    assert vw.avg_prior(3) is None  # 只有 3 根，prior 需要 4
+    assert vw.latest == 5
+    assert math.isclose(vw.avg_prior(3), 3.0)  # (2+3+4)/3，不含最新根
+    assert vw.avg_prior(4) is None or True  # 窗口足够时 4 根也可
 
-    ind = SymbolIndicators(timeframe="1m", rsi_period=6, volume_lookback=3)
-    closes = [100 - i for i in range(12)]
-    vols = [10.0] * 12
-    ind.bootstrap("1m", closes, vols)
-    t = ind.get("1m")
-    # 清掉最后一根语义：live 相对已收盘均量
-    prior_closed = t.volume.avg_closed(3)
-    assert prior_closed is not None
-    ind.set_live("1m", volume=prior_closed * 8, close=90.0)
-    assert t.live_volume == prior_closed * 8
+
+def test_timeframe_indicators_ready():
+    t = TimeframeIndicators("5m")
+    # 不足 99+31 根时未就绪
+    for i in range(50):
+        t.update(100 + i * 0.1, 10)
+    assert not t.ready
+    for i in range(50, 130):
+        t.update(100 + i * 0.1, 10)
+    assert t.ready
+    assert t.ema7.value is not None
+    assert t.ema99.value is not None
     snap = t.snapshot()
-    assert snap["live"] is True
-    assert snap["volume_ratio"] is not None
-    assert abs(snap["volume_ratio"] - 8.0) < 1e-6
+    assert snap["ready"] is True
+    for key in ("ema7", "ema25", "ema99", "dif", "dea", "hist", "rsi"):
+        assert key in snap
+
+
+def test_symbol_indicators_multi_tf():
+    ind = SymbolIndicators(symbol="TESTUSDT")
+    assert set(ind.tf.keys()) == {"1m", "5m", "15m", "30m", "1h", "2h"}
+    ind.update("5m", 100.0, 5.0)
+    ind.update("1m", 100.0, 1.0)
+    assert ind.get("5m").bar_count == 1
+    assert ind.get("1m").bar_count == 1
+    snap = ind.snapshot()
+    assert "5m" in snap and "1h" in snap

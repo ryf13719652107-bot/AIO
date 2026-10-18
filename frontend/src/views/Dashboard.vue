@@ -255,7 +255,7 @@ const config = reactive({
   strategy: mergeStrategyParams(null),
   symbols: [],
 })
-const runtime = ref({ positions: [], screener: {}, timeframe: '1m' })
+const runtime = ref({ positions: [], screener: {}, timeframe: '5m' })
 const lastUpdate = ref(null)
 const lastUpdateText = ref('—')
 let updateTimer = null
@@ -681,13 +681,13 @@ function tradeClass(t) {
 const TRADE_EVENT_LABELS = {
   OPEN: '开仓',
   ADD: '加仓',
-  CLOSE_TP: '止盈平仓',
-  CLOSE_TP1: '止盈1回报率',
-  CLOSE_TP2: '止盈2 RSI',
-  CLOSE_SL: '止损平仓',
-  CLOSE_SL1: '止损1(已废弃)',
-  CLOSE_SL2: '止损2浮亏',
-  CLOSE_REVERSE: '反手平仓',
+  CLOSE_TP1: 'TP1 止盈',
+  CLOSE_TP2: 'TP2 止盈',
+  CLOSE_TP3: 'TP3 止盈',
+  CLOSE_TP4: 'TP4 止盈',
+  CLOSE_TP5: 'TP5 止盈',
+  CLOSE_TP6: 'TP6 止盈',
+  CLOSE_BREAKEVEN: '保本损平仓',
   CLOSE_MANUAL: '手动平仓',
   CLOSE_EXTERNAL: '外部平仓/强平',
 }
