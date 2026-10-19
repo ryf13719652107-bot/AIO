@@ -149,6 +149,7 @@ class StrategyEngine:
         self._screener_task: Optional[asyncio.Task] = None
         self._bootstrap_retry_task: Optional[asyncio.Task] = None
         self._indicator_save_task: Optional[asyncio.Task] = None
+        self._gap_retry_pending: bool = False  # 停机缺口回补未完成（retry_loop 兜底）
         self._boot_task: Optional[asyncio.Task] = None
         self.booting: bool = False
         self._bootstrap_last_open: dict[tuple[str, str], int] = {}
@@ -437,6 +438,17 @@ class StrategyEngine:
             await db.execute(stmt)
             await db.commit()
 
+    async def _delete_indicator_state(self, symbol: str):
+        """币种被选币淘汰后清理其指标快照，防 DB 膨胀。"""
+        try:
+            async with AsyncSessionLocal() as db:
+                await db.execute(
+                    delete(IndicatorState).where(IndicatorState.symbol == symbol)
+                )
+                await db.commit()
+        except Exception as e:
+            logger.warning("清理指标快照 %s 失败: %s", symbol, e)
+
     async def _load_position_states(self):
         """启动时从 DB 恢复仓位状态（在 adopt 之前）。"""
         async with AsyncSessionLocal() as db:
@@ -567,8 +579,10 @@ class StrategyEngine:
         if not todo:
             return
         await self._log("INFO", "engine", f"回补停机缺口: {len(todo)} 个周期…")
+        interrupted = False
         for sym, tf, n in todo:
             if time.time() < self._rest_banned_until:
+                interrupted = True
                 await self._log("WARN", "engine", "缺口回补暂停：REST 熔断中（将自动重试）")
                 break
             try:
@@ -584,9 +598,20 @@ class StrategyEngine:
                     self._bootstrap_last_open[(sym, tf)] = ot
                 await asyncio.sleep(0.15)
             except Exception as e:
+                interrupted = True
                 logger.warning("缺口回补 %s %s: %s", sym, tf, e)
+        if interrupted:
+            # 标记缺口未补完：retry_loop 会再次调用本方法（按当前推进点重算，幂等）
+            self._gap_retry_pending = True
+            await self._log(
+                "WARN", "engine",
+                f"缺口回补未完成，{len(todo)} 个周期将由后台自动重试",
+            )
+        else:
+            self._gap_retry_pending = False
         await self._save_indicator_states()
-        await self._log("INFO", "engine", "停机缺口回补完成")
+        if not interrupted:
+            await self._log("INFO", "engine", "停机缺口回补完成")
 
     # ---------------- 选币 ----------------
     async def _run_screen_and_sync(self, initial: bool = False):
@@ -602,9 +627,8 @@ class StrategyEngine:
                 restored = await self._load_indicator_states()
                 if restored:
                     await self._fill_indicator_gaps()
-                for sym in self.symbols:
-                    if not self._symbol_bootstrapped(sym):
-                        await self._bootstrap_symbol(sym)
+                # 未恢复的币并发 bootstrap（内部按周期跳过已恢复部分）
+                await self._bootstrap_all_symbols()
                 await self._log(
                     "INFO", "screener",
                     f"启动沿用已保存币种: {len(self.symbols)} 个"
@@ -649,6 +673,7 @@ class StrategyEngine:
                 legs = self.positions.get(sym)
                 if legs and all(p.is_flat for p in legs.values()):
                     self.cfg_symbols.pop(sym, None)
+                    await self._delete_indicator_state(sym)
 
             self.symbols = new_symbols
             await self._adopt_exchange_positions(tag="选币同步")
@@ -956,6 +981,11 @@ class StrategyEngine:
                 if not self.running:
                     continue
                 if time.time() < self._rest_banned_until:
+                    continue
+                # 优先：未完成的停机缺口回补（幂等，按推进点重算）
+                if self._gap_retry_pending:
+                    self._gap_retry_pending = False
+                    await self._fill_indicator_gaps()
                     continue
                 pending = [
                     sym for sym in list(self.symbols)
