@@ -766,6 +766,7 @@ class StrategyEngine:
                 await asyncio.sleep(BOOTSTRAP_PAUSE_SEC)
             if done >= len(self._feed_intervals()):
                 await self._log("INFO", sym, f"指标 bootstrap 完成（{done} 个周期）")
+                self._seed_entry_condition(sym)
             elif done:
                 await self._log("WARN", sym, f"指标 bootstrap 部分完成（{done} 个周期，等待自动补拉）")
         except Exception as e:
@@ -780,6 +781,29 @@ class StrategyEngine:
             (sym, tf) in self._bootstrap_last_open
             for tf in self._feed_intervals()
         )
+
+    def _seed_entry_condition(self, sym: str):
+        """bootstrap 完成后立即记录开仓条件状态（首录提前到启动瞬间）。
+
+        规则1 仍保留：启动时历史数据已满足不追单，但下一次 5m 收盘重新
+        判定满足即可开仓 —— 启动后最多等 1 个收盘（≤5 分钟）。
+        """
+        ind = self.indicators.get(sym)
+        if ind is None:
+            return
+        now = datetime.now(TZ_CN).strftime("%H:%M:%S")
+        for direction in DIRECTIONS:
+            key = (sym, direction)
+            if key in self._last_entry_cond:
+                continue
+            ok, reason = StrategyRules.entry_ready(self.cfg_strategy, ind, direction)
+            self._last_entry_cond[key] = ok
+            self._entry_diag[key] = {
+                "ok": bool(ok),
+                "reason": (f"满足·等下个收盘开仓" if ok else f"不满足·{reason}"),
+                "first": True,
+                "ts": now,
+            }
 
     async def _bootstrap_all_symbols(self):
         sem = asyncio.Semaphore(BOOTSTRAP_SYMBOL_CONCURRENCY)
