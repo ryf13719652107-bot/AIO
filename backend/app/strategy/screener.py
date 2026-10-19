@@ -78,7 +78,7 @@ class SymbolScreener:
         usdt_symbols = set(await exchange_client.get_usdt_perpetual_symbols())
 
         async with httpx.AsyncClient() as client:
-            if cfg.enable_mcap or cfg.enable_mcap_max:
+            if cfg.enable_mcap:
                 await self._load_coingecko_mcap(client, force=refresh_mcap)
 
         results: list[SymbolScreenResult] = []
@@ -91,21 +91,19 @@ class SymbolScreener:
             base = self._base_from_symbol(sym)
             mcap = self._mcap_by_base.get(base)
 
-            if cfg.enable_volume and quote_vol < cfg.volume_min_usd:
-                continue
-            if (
-                getattr(cfg, "volume_max_usd", None)
-                and quote_vol > cfg.volume_max_usd
-            ):
-                continue
+            if cfg.enable_volume:
+                # 成交额需在 [下限, 上限] 内
+                if quote_vol < cfg.volume_min_usd:
+                    continue
+                if quote_vol > cfg.volume_max_usd:
+                    continue
             if cfg.enable_price and price >= cfg.price_max_usd:
                 continue
             if cfg.enable_mcap:
+                # 市值需在 [下限, 上限] 内；无市值数据时不拦截
                 if mcap is None or mcap < cfg.mcap_min_usd:
                     continue
-            if cfg.enable_mcap_max:
-                # 已知市值且超过上限则排除；无市值数据时不因上限拦截
-                if mcap is not None and mcap > cfg.mcap_max_usd:
+                if mcap > cfg.mcap_max_usd:
                     continue
 
             results.append(SymbolScreenResult(
