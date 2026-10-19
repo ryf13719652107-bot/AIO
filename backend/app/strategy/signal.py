@@ -335,8 +335,9 @@ class StrategyRules:
 
         口径与收盘版完全一致（档位/阈值/方向/双周期 AND/各档仅一次），
         仅数据源改为实时试算，满足即触发（先到先执行，不等周期收盘）。
+        保本损武装后剩余档位仍可触发（与收盘版一致，文档：先到先执行）。
         """
-        if pos.is_flat or pos.breakeven_armed:
+        if pos.is_flat:
             return None
         ex = params.exit
         if not ex.enable_tp6:

@@ -376,11 +376,22 @@ def test_tp6_live_check_short_direction_and_armed_guard():
     # 空单：mark=50 → delta=-50 → 实时 RSI≈8.3 ≤10 → 触发
     act = StrategyRules.tp6_live_check(params, ind, pos, mark=50.0)
     assert act is not None and act.trigger_key == "t5m" and act.close_pct == 10.0
-    # 保本损武装后不再做 TP6 实时检查
-    pos2 = _short_pos()
-    pos2.fire_tp6("t5m")
-    pos2.breakeven_armed = True
-    assert StrategyRules.tp6_live_check(params, ind, pos2, mark=50.0) is None
+
+
+def test_tp6_live_check_remaining_levels_after_breakeven_armed():
+    """保本损武装后：已触发档不再重复；剩余档位仍可先到先触发（文档L59）。"""
+    params = StrategyParams()
+    ind = SymbolIndicators(symbol="TESTUSDT")
+    _live_rsi_ready(ind, "5m")
+    _live_rsi_ready(ind, "15m")
+    pos = _short_pos()
+    pos.fire_tp6("t5m")     # t5m 已触发（保本损同时武装）
+    pos.breakeven_armed = True
+    # mark=50：t5m 已 fired 跳过，但 15m 档实时 RSI≈8.3 ≤7?否→不触发 t15m（阈值7）
+    assert StrategyRules.tp6_live_check(params, ind, pos, mark=50.0) is None
+    # mark 更低（如 30）→ 15m 实时 RSI≈6.25 ≤7 → 武装后仍触发 t15m 平30%
+    act = StrategyRules.tp6_live_check(params, ind, pos, mark=30.0)
+    assert act is not None and act.trigger_key == "t15m" and act.close_pct == 30.0
 
 
 def test_full_close_priority_over_tp6():

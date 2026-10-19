@@ -1283,11 +1283,10 @@ class StrategyEngine:
                             await self._execute_action(symbol, act, direction)
 
                     # TP6 多周期 RSI 分批（mark 实时试算 RSI 盯价，各档仅一次；
-                    # 触发后 fire_tp6 武装保本损，剩余仓位由其余止盈条件管理）
-                    if not pos.breakeven_armed:
-                        act = StrategyRules.tp6_live_check(params, ind, pos, mark)
-                        if act is not None and act.type == "CLOSE_TP6":
-                            await self._execute_action(symbol, act, direction)
+                    # 首档触发即武装保本损，武装后剩余档位仍可先到先触发）
+                    act = StrategyRules.tp6_live_check(params, ind, pos, mark)
+                    if act is not None and act.type == "CLOSE_TP6":
+                        await self._execute_action(symbol, act, direction)
 
                     # 保本损：mark 触及开仓均价 → 剩余全平
                     if pos.breakeven_armed and pos.quantity > 0:
