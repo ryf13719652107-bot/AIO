@@ -30,7 +30,14 @@ from app.exchange.binance_rest import BinanceFuturesClient
 from app.exchange.binance_ws import BinanceFuturesWS
 from app.exchange.binance_poller import BinanceFuturesPoller
 from app.exchange.binance_ticker_ws import BinanceTickerBook
-from app.models import EngineState, PositionLog, PositionState, StrategyConfig, Trade
+from app.models import (
+    EngineState,
+    IndicatorState,
+    PositionLog,
+    PositionState,
+    StrategyConfig,
+    Trade,
+)
 from app.schemas import (
     SIGNAL_TIMEFRAME, TIMEFRAMES, GlobalConfig, StrategyConfigPayload,
     StrategyParams, SymbolConfig,
@@ -141,6 +148,7 @@ class StrategyEngine:
         self._position_sync_task: Optional[asyncio.Task] = None
         self._screener_task: Optional[asyncio.Task] = None
         self._bootstrap_retry_task: Optional[asyncio.Task] = None
+        self._indicator_save_task: Optional[asyncio.Task] = None
         self._boot_task: Optional[asyncio.Task] = None
         self.booting: bool = False
         self._bootstrap_last_open: dict[tuple[str, str], int] = {}
@@ -464,11 +472,145 @@ class StrategyEngine:
         if restored:
             await self._log("INFO", "engine", f"已从 DB 恢复 {restored} 个仓位状态")
 
+    # ---------------- 指标状态持久化（重启免全量 bootstrap） ----------------
+    async def _load_indicator_states(self) -> int:
+        """启动时恢复指标增量状态；返回成功恢复的币种数。"""
+        async with AsyncSessionLocal() as db:
+            res = await db.execute(select(IndicatorState))
+            rows = list(res.scalars().all())
+
+        restored = 0
+        tfs = self._feed_intervals()
+        for row in rows:
+            sym = row.symbol
+            if sym not in self.indicators or not _valid_symbol(sym):
+                continue
+            try:
+                raw = row.state_json
+                state = json.loads(raw) if isinstance(raw, str) else dict(raw or {})
+            except Exception:
+                continue
+            if not isinstance(state, dict) or not all(tf in state for tf in tfs):
+                continue  # 周期不齐 → 该币走全量 bootstrap
+            ind = self.indicators[sym]
+            if not ind.load_state(state):
+                continue
+            for tf in tfs:
+                ot = (state.get(tf) or {}).get("bar_open")
+                if ot:
+                    ot = int(ot)
+                    self._bootstrap_last_open[(sym, tf)] = ot
+                    self._last_kline_open[(sym, tf)] = ot
+            restored += 1
+        if restored:
+            await self._log(
+                "INFO", "engine",
+                f"指标状态恢复: {restored} 个币种（跳过全量 bootstrap）",
+            )
+        return restored
+
+    async def _save_indicator_states(self, symbols: Optional[list[str]] = None):
+        """把全部指标增量状态写入 DB（含每周期最后已收盘 K 的 open time）。"""
+        syms = symbols if symbols is not None else list(self.symbols)
+        try:
+            async with AsyncSessionLocal() as db:
+                for sym in syms:
+                    ind = self.indicators.get(sym)
+                    if ind is None or not self._symbol_bootstrapped(sym):
+                        continue
+                    state = ind.save_state()
+                    for tf in state:
+                        ot = self._bootstrap_last_open.get((sym, tf))
+                        if ot:
+                            state[tf]["bar_open"] = int(ot)
+                    res = await db.execute(
+                        select(IndicatorState).where(IndicatorState.symbol == sym)
+                    )
+                    row = res.scalar_one_or_none()
+                    if row is None:
+                        row = IndicatorState(symbol=sym)
+                        db.add(row)
+                    row.state_json = json.dumps(state, ensure_ascii=False)
+                    row.updated_at = datetime.utcnow()
+                await db.commit()
+        except Exception as e:
+            logger.warning("保存指标状态失败: %s", e)
+
+    async def _indicator_save_loop(self):
+        try:
+            while True:
+                await asyncio.sleep(60)
+                if self.running:
+                    await self._save_indicator_states()
+        except asyncio.CancelledError:
+            pass
+
+    async def _fill_indicator_gaps(self):
+        """恢复状态后只回补停机期间的缺口 K 线（小请求、带熔断保护）。"""
+        if not self.exchange:
+            return
+        tf_ms = {"1m": 60_000, "5m": 300_000, "15m": 900_000,
+                 "30m": 1_800_000, "1h": 3_600_000, "2h": 7_200_000}
+        now_ms = int(time.time() * 1000)
+        todo = []
+        for sym in list(self.symbols):
+            if sym not in self.indicators:
+                continue
+            for tf in self._feed_intervals():
+                last = self._last_kline_open.get((sym, tf))
+                if not last:
+                    continue  # 该周期未恢复 → 交给全量 bootstrap
+                step = tf_ms.get(tf, 300_000)
+                gap = int((now_ms - (last + step)) // step) + 1
+                if gap > 0:
+                    todo.append((sym, tf, min(gap, BOOTSTRAP_LIMIT)))
+        if not todo:
+            return
+        await self._log("INFO", "engine", f"回补停机缺口: {len(todo)} 个周期…")
+        for sym, tf, n in todo:
+            if time.time() < self._rest_banned_until:
+                await self._log("WARN", "engine", "缺口回补暂停：REST 熔断中（将自动重试）")
+                break
+            try:
+                klines = await self._get_klines_safe(sym, tf, limit=n)
+                for row in klines[:-1]:
+                    ot = int(row[0])
+                    if ot <= self._last_kline_open.get((sym, tf), 0):
+                        continue
+                    self.indicators[sym].update(
+                        tf, float(row[4]), float(row[5]), float(row[1]),
+                    )
+                    self._last_kline_open[(sym, tf)] = ot
+                    self._bootstrap_last_open[(sym, tf)] = ot
+                await asyncio.sleep(0.15)
+            except Exception as e:
+                logger.warning("缺口回补 %s %s: %s", sym, tf, e)
+        await self._save_indicator_states()
+        await self._log("INFO", "engine", "停机缺口回补完成")
+
     # ---------------- 选币 ----------------
     async def _run_screen_and_sync(self, initial: bool = False):
         if not self.exchange:
             return
         try:
+            # 启动时沿用已保存币种列表：不重新选币，恢复指标状态 + 只补缺口
+            if initial and self.cfg_symbols:
+                for sym in list(self.cfg_symbols):
+                    if _valid_symbol(sym):
+                        self._ensure_symbol(sym)
+                self.symbols = [s for s in self.cfg_symbols if _valid_symbol(s)]
+                restored = await self._load_indicator_states()
+                if restored:
+                    await self._fill_indicator_gaps()
+                for sym in self.symbols:
+                    if not self._symbol_bootstrapped(sym):
+                        await self._bootstrap_symbol(sym)
+                await self._log(
+                    "INFO", "screener",
+                    f"启动沿用已保存币种: {len(self.symbols)} 个"
+                    f"（指标恢复 {restored}，未重新选币）",
+                )
+                return
             results = await self.screener.screen(
                 self.exchange, self.cfg_strategy, refresh_mcap=not initial,
             )
@@ -600,6 +742,7 @@ class StrategyEngine:
             self._position_sync_task = asyncio.create_task(self._periodic_position_sync())
             self._screener_task = asyncio.create_task(self._screener_loop())
             self._bootstrap_retry_task = asyncio.create_task(self._bootstrap_retry_loop())
+            self._indicator_save_task = asyncio.create_task(self._indicator_save_loop())
             await self._log(
                 "INFO", "engine",
                 f"策略引擎已就绪 (paper={self.paper_trading}, "
@@ -627,8 +770,13 @@ class StrategyEngine:
         self.booting = False
         self._run_epoch = getattr(self, "_run_epoch", 0) + 1
         self._mark_busy.clear()
+        # 停止前保存一次指标状态（下次重启免全量 bootstrap）
+        try:
+            await self._save_indicator_states()
+        except Exception:
+            pass
         for task in (self._boot_task, self._position_sync_task, self._screener_task,
-                     self._bootstrap_retry_task):
+                     self._bootstrap_retry_task, self._indicator_save_task):
             if task:
                 task.cancel()
                 try:
@@ -639,6 +787,7 @@ class StrategyEngine:
         self._position_sync_task = None
         self._screener_task = None
         self._bootstrap_retry_task = None
+        self._indicator_save_task = None
         if self._ws_watchdog_task:
             self._ws_watchdog_task.cancel()
             try:
@@ -748,6 +897,10 @@ class StrategyEngine:
         done = 0
         try:
             for tf in self._feed_intervals():
+                # 已从 DB 恢复或已回补的周期不重复 bootstrap（防指标重复递推）
+                if (sym, tf) in self._bootstrap_last_open:
+                    done += 1
+                    continue
                 if time.time() < self._rest_banned_until:
                     break
                 klines = await self._get_klines_safe(sym, tf, limit=BOOTSTRAP_LIMIT)
@@ -766,7 +919,6 @@ class StrategyEngine:
                 await asyncio.sleep(BOOTSTRAP_PAUSE_SEC)
             if done >= len(self._feed_intervals()):
                 await self._log("INFO", sym, f"指标 bootstrap 完成（{done} 个周期）")
-                self._seed_entry_condition(sym)
             elif done:
                 await self._log("WARN", sym, f"指标 bootstrap 部分完成（{done} 个周期，等待自动补拉）")
         except Exception as e:
@@ -781,29 +933,6 @@ class StrategyEngine:
             (sym, tf) in self._bootstrap_last_open
             for tf in self._feed_intervals()
         )
-
-    def _seed_entry_condition(self, sym: str):
-        """bootstrap 完成后立即记录开仓条件状态（首录提前到启动瞬间）。
-
-        规则1 仍保留：启动时历史数据已满足不追单，但下一次 5m 收盘重新
-        判定满足即可开仓 —— 启动后最多等 1 个收盘（≤5 分钟）。
-        """
-        ind = self.indicators.get(sym)
-        if ind is None:
-            return
-        now = datetime.now(TZ_CN).strftime("%H:%M:%S")
-        for direction in DIRECTIONS:
-            key = (sym, direction)
-            if key in self._last_entry_cond:
-                continue
-            ok, reason = StrategyRules.entry_ready(self.cfg_strategy, ind, direction)
-            self._last_entry_cond[key] = ok
-            self._entry_diag[key] = {
-                "ok": bool(ok),
-                "reason": (f"满足·等下个收盘开仓" if ok else f"不满足·{reason}"),
-                "first": True,
-                "ts": now,
-            }
 
     async def _bootstrap_all_symbols(self):
         sem = asyncio.Semaphore(BOOTSTRAP_SYMBOL_CONCURRENCY)

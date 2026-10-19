@@ -8,6 +8,39 @@ from app.strategy.indicators import (
 )
 
 
+def test_state_roundtrip_continues_incrementally():
+    """save_state/load_state 后继续喂 K 线，结果应与不中断完全一致。"""
+    closes = [100 + i * 0.5 + (i % 7) * 0.3 for i in range(120)]
+    vols = [10 + (i % 5) * 2 for i in range(120)]
+
+    a = SymbolIndicators(symbol="TESTUSDT")
+    for c, v in zip(closes, vols):
+        a.update("5m", c, v)
+
+    snap = a.save_state()
+    b = SymbolIndicators(symbol="TESTUSDT")
+    assert b.load_state(snap)
+
+    # 继续喂同一批后续 K 线，两者结果必须一致
+    for c, v in zip(closes, vols):
+        a.update("5m", c, v)
+        b.update("5m", c, v)
+    for tf_name in ("ema7", "ema25", "ema99"):
+        ea = getattr(a.get("5m"), tf_name).value
+        eb = getattr(b.get("5m"), tf_name).value
+        assert math.isclose(ea, eb, rel_tol=1e-9)
+    assert a.get("5m").ready and b.get("5m").ready
+    assert math.isclose(a.get("5m").rsi.value, b.get("5m").rsi.value, rel_tol=1e-9)
+    assert list(a.get("5m").macd.hist_history) == list(b.get("5m").macd.hist_history)
+    assert a.get("5m").volume.avg_prior() == b.get("5m").volume.avg_prior()
+
+
+def test_load_state_garbage_returns_false():
+    ind = SymbolIndicators(symbol="TESTUSDT")
+    assert not ind.load_state({})
+    assert not ind.load_state({"5m": {"bad": 1}})
+
+
 def test_ema_sma_seed_then_recursive():
     ema = EMAState(period=3)
     ema.update(1)

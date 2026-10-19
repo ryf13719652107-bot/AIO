@@ -182,6 +182,18 @@ class VolumeWindow:
         return latest / avg
 
 
+def _ema_dump(st: EMAState) -> dict:
+    return {"p": st.period, "v": st.value, "i": st.initialized, "seed": list(st._seed)}
+
+
+def _ema_load(d: dict) -> EMAState:
+    st = EMAState(period=int(d["p"]))
+    st.value = d.get("v")
+    st.initialized = bool(d.get("i"))
+    st._seed = list(d.get("seed") or [])
+    return st
+
+
 class TimeframeIndicators:
     """单周期指标：EMA7/25/99 + MACD + RSI(6) + 成交量窗口。"""
 
@@ -243,6 +255,65 @@ class TimeframeIndicators:
             vol = volumes[i] if volumes and i < len(volumes) else None
             op = opens[i] if opens and i < len(opens) else None
             self.update(c, vol, op)
+
+    # ---- 状态序列化（重启免全量 bootstrap）----
+    def save_state(self) -> dict:
+        macd = self.macd
+        return {
+            "tf": self.timeframe,
+            "rsi": {
+                "p": self.rsi.period, "v": self.rsi.value, "i": self.rsi.initialized,
+                "ag": self.rsi._avg_gain, "al": self.rsi._avg_loss,
+                "pc": self.rsi._prev_close,
+                "bg": list(self.rsi._bootstrap_gains), "bl": list(self.rsi._bootstrap_losses),
+            },
+            "vol": {"lb": self.volume.lookback, "vols": list(self.volume.volumes)},
+            "ema7": _ema_dump(self.ema7),
+            "ema25": _ema_dump(self.ema25),
+            "ema99": _ema_dump(self.ema99),
+            "macd": {
+                "ef": _ema_dump(macd._ema_fast), "es": _ema_dump(macd._ema_slow),
+                "sp": macd._signal_prev, "dif": macd.dif, "dea": macd.dea,
+                "hist": macd.hist, "hh": list(macd.hist_history),
+            },
+            "last_close": self.last_close, "last_open": self.last_open,
+            "bar_count": self.bar_count,
+        }
+
+    def load_state(self, d: dict) -> bool:
+        try:
+            r = d["rsi"]
+            self.rsi = RSIState(
+                period=int(r["p"]), value=r["v"], initialized=bool(r["i"]),
+                _avg_gain=float(r.get("ag") or 0.0), _avg_loss=float(r.get("al") or 0.0),
+                _prev_close=r.get("pc"),
+                _bootstrap_gains=list(r.get("bg") or []),
+                _bootstrap_losses=list(r.get("bl") or []),
+            )
+            v = d["vol"]
+            self.volume = VolumeWindow(lookback=int(v.get("lb") or 30))
+            for x in (v.get("vols") or []):
+                self.volume.update(float(x))
+            self.ema7 = _ema_load(d["ema7"])
+            self.ema25 = _ema_load(d["ema25"])
+            self.ema99 = _ema_load(d["ema99"])
+            m = d["macd"]
+            self.macd = MACDState(
+                fast=int(m.get("fast") or 12), slow=int(m.get("slow") or 26),
+                signal=int(m.get("signal") or 9),
+                _ema_fast=_ema_load(m["ef"]), _ema_slow=_ema_load(m["es"]),
+                _signal_prev=m.get("sp"), dif=m.get("dif"), dea=m.get("dea"),
+                hist=m.get("hist"),
+            )
+            for x in (m.get("hh") or []):
+                self.macd.hist_history.append(float(x))
+            self.last_close = d.get("last_close")
+            self.last_open = d.get("last_open")
+            self.bar_count = int(d.get("bar_count") or 0)
+            self.clear_live()
+            return True
+        except Exception:
+            return False
 
     def _live_view(self, price: float) -> dict:
         """用未收盘价格试算实时指标（纯展示，不改任何增量状态）。
@@ -382,3 +453,19 @@ class SymbolIndicators:
             tf: ind.snapshot(latest_price)
             for tf, ind in self.tf.items()
         }
+
+    def save_state(self) -> dict:
+        """持久化全部周期的增量状态（重启免全量 bootstrap）。"""
+        return {tf: ind.save_state() for tf, ind in self.tf.items()}
+
+    def load_state(self, d: dict) -> bool:
+        """恢复增量状态；任一周期失败返回 False（由调用方回退全量 bootstrap）。"""
+        if not isinstance(d, dict) or not d:
+            return False
+        ok_any = False
+        for tf, sd in d.items():
+            if tf not in self.tf:
+                continue
+            if self.tf[tf].load_state(sd):
+                ok_any = True
+        return ok_any
