@@ -1131,8 +1131,9 @@ class StrategyEngine:
             key = (symbol, direction)
             prev = self._last_entry_cond.get(key)
             self._last_entry_cond[key] = ok
-            if not ok or prev is not False:
-                # prev=None：启动后首次评估仅记录（规则1）；prev=True：无新边沿
+            if not ok or prev is None:
+                # prev=None：启动后首次评估仅记录（规则1：接入瞬间不追单）；
+                # 之后每个 5m 收盘重新判定，满足即开（无需 false→true 边沿）
                 continue
             if not self.cfg_strategy.order_plan.enable_first:
                 continue
