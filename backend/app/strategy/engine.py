@@ -42,6 +42,11 @@ from app.strategy.signal import Action, StrategyRules
 
 logger = logging.getLogger(__name__)
 
+
+def _valid_symbol(sym: str) -> bool:
+    """币安合约符号必须是纯 ASCII 字母数字（过滤历史脏数据，如中文符号）。"""
+    return bool(sym) and sym.isascii() and sym.isalnum()
+
 TZ_CN = ZoneInfo("Asia/Shanghai")
 TF_MS = {
     "1m": 60_000, "5m": 300_000, "15m": 900_000,
@@ -236,11 +241,17 @@ class StrategyEngine:
         self.cfg_global = payload.global_
         self.cfg_strategy = payload.strategy
         for sc in payload.symbols:
+            if not _valid_symbol(sc.symbol):
+                logger.warning("忽略非法币种符号: %r", sc.symbol)
+                continue
             self.cfg_symbols[sc.symbol] = sc
             self._ensure_symbol(sc.symbol)
         # 运行中勿用前端不完整的 symbols 覆盖监控列表
         if payload.symbols and not (self.running or self.booting):
-            self.symbols = [s.symbol for s in payload.symbols if s.enabled]
+            self.symbols = [
+                s.symbol for s in payload.symbols
+                if s.enabled and _valid_symbol(s.symbol)
+            ]
 
     def _ensure_symbol(self, symbol: str):
         if symbol not in self.indicators:
@@ -422,6 +433,9 @@ class StrategyEngine:
             if not row.symbol or row.direction not in DIRECTIONS:
                 continue
             sym = row.symbol
+            if not _valid_symbol(sym):
+                logger.warning("跳过非法持仓符号: %r", sym)
+                continue
             self._ensure_symbol(sym)
             if sym not in self.cfg_symbols:
                 self.cfg_symbols[sym] = SymbolConfig(symbol=sym, enabled=True)
@@ -465,13 +479,14 @@ class StrategyEngine:
             self._last_screen_at = datetime.now(TZ_CN)
             self._screen_count += 1
 
-            screened = [r.symbol for r in results]
+            screened = [r.symbol for r in results if _valid_symbol(r.symbol)]
             holding_mem = [
                 s for s, legs in self.positions.items()
                 if any(not p.is_flat for p in legs.values())
             ]
             holding_ex = await self._exchange_holding_symbols()
             new_symbols = list(dict.fromkeys(holding_mem + holding_ex + screened))
+            new_symbols = [s for s in new_symbols if _valid_symbol(s)]
             prev_symbols = set(self.symbols)
 
             for sym in new_symbols:
@@ -937,7 +952,7 @@ class StrategyEngine:
         by_sym: dict[str, list[tuple[str, float, float]]] = {}
         for row in rows:
             sym = row.get("symbol")
-            if not sym:
+            if not sym or not _valid_symbol(sym):
                 continue
             direction, qty, entry = self._dir_from_exchange_row(row)
             if direction == "FLAT" or qty <= 0:
