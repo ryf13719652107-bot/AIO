@@ -140,6 +140,7 @@ class StrategyEngine:
 
         self._position_sync_task: Optional[asyncio.Task] = None
         self._screener_task: Optional[asyncio.Task] = None
+        self._bootstrap_retry_task: Optional[asyncio.Task] = None
         self._boot_task: Optional[asyncio.Task] = None
         self.booting: bool = False
         self._bootstrap_last_open: dict[tuple[str, str], int] = {}
@@ -596,6 +597,7 @@ class StrategyEngine:
             await self._start_market_feed()
             self._position_sync_task = asyncio.create_task(self._periodic_position_sync())
             self._screener_task = asyncio.create_task(self._screener_loop())
+            self._bootstrap_retry_task = asyncio.create_task(self._bootstrap_retry_loop())
             await self._log(
                 "INFO", "engine",
                 f"策略引擎已就绪 (paper={self.paper_trading}, "
@@ -623,7 +625,8 @@ class StrategyEngine:
         self.booting = False
         self._run_epoch = getattr(self, "_run_epoch", 0) + 1
         self._mark_busy.clear()
-        for task in (self._boot_task, self._position_sync_task, self._screener_task):
+        for task in (self._boot_task, self._position_sync_task, self._screener_task,
+                     self._bootstrap_retry_task):
             if task:
                 task.cancel()
                 try:
@@ -633,6 +636,7 @@ class StrategyEngine:
         self._boot_task = None
         self._position_sync_task = None
         self._screener_task = None
+        self._bootstrap_retry_task = None
         if self._ws_watchdog_task:
             self._ws_watchdog_task.cancel()
             try:
@@ -739,6 +743,7 @@ class StrategyEngine:
             await self._log("WARN", sym, "跳过 bootstrap：REST 熔断中")
             return
         ind = self.indicators[sym]
+        done = 0
         try:
             for tf in self._feed_intervals():
                 if time.time() < self._rest_banned_until:
@@ -755,8 +760,12 @@ class StrategyEngine:
                     ot = int(closed[-1][0])
                     self._bootstrap_last_open[(sym, tf)] = ot
                     self._last_kline_open[(sym, tf)] = ot
+                done += 1
                 await asyncio.sleep(BOOTSTRAP_PAUSE_SEC)
-            await self._log("INFO", sym, f"指标 bootstrap 完成（{len(self._feed_intervals())} 个周期）")
+            if done >= len(self._feed_intervals()):
+                await self._log("INFO", sym, f"指标 bootstrap 完成（{done} 个周期）")
+            elif done:
+                await self._log("WARN", sym, f"指标 bootstrap 部分完成（{done} 个周期，等待自动补拉）")
         except Exception as e:
             logger.error("bootstrap %s: %s", sym, e)
             await self._log("ERROR", sym, f"bootstrap 失败: {e}")
@@ -780,6 +789,36 @@ class StrategyEngine:
                 await self._bootstrap_symbol(sym)
 
         await asyncio.gather(*[_one(sym) for sym in self.symbols])
+
+    async def _bootstrap_retry_loop(self):
+        """熔断被跳过/失败的币自动补拉 bootstrap，直到全部完成。
+
+        低速率（串行 + 每币间隔），避免解封后又一波 REST 打爆权重。
+        """
+        try:
+            while True:
+                await asyncio.sleep(30)
+                if not self.running:
+                    continue
+                if time.time() < self._rest_banned_until:
+                    continue
+                pending = [
+                    sym for sym in list(self.symbols)
+                    if sym in self.indicators and not self._symbol_bootstrapped(sym)
+                ]
+                if not pending:
+                    continue
+                await self._log(
+                    "INFO", "engine",
+                    f"补拉 bootstrap：{len(pending)} 个币种待完成",
+                )
+                for sym in pending:
+                    if not self.running or time.time() < self._rest_banned_until:
+                        break
+                    await self._bootstrap_symbol(sym)
+                    await asyncio.sleep(max(BOOTSTRAP_PAUSE_SEC, 0.5))
+        except asyncio.CancelledError:
+            pass
 
     async def _backfill_klines_after_disconnect(self):
         """WS 重连后用 REST 回补缺口：只更新指标，不触发交易。"""
