@@ -25,6 +25,14 @@
           </span>
           <span :class="pnlClass">{{ formatPnl(runtime?.unrealized_pnl) }}</span>
         </div>
+        <div class="diag-line" v-if="runtime?.entry_diag">
+          <template v-for="(d, dir) in runtime.entry_diag" :key="dir">
+            <span v-if="d" class="diag" :class="d.ok ? 'ok' : 'no'"
+                  :title="`评估时间 ${d.ts}${d.first ? ' · 启动后首次仅记录' : ''}`">
+              {{ dir === 'LONG' ? '多' : '空' }}{{ d.ok ? ' ✓可开' : ` ✗ ${d.reason}` }}{{ d.first ? ' ·首录' : '' }}
+            </span>
+          </template>
+        </div>
       </div>
       <el-button v-if="runtime && runtime.direction !== 'FLAT'" type="danger" size="small" plain @click="$emit('emergency', cfg.symbol)">
         紧急平仓
@@ -154,6 +162,9 @@ function histClass(v) {
 .sym { font-weight: 700; color: #e8ecf4; font-size: 14px; }
 .meta-line { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 4px; font-size: 12px; color: #8a93a7; }
 .meta-line b { color: #d6dae3; font-weight: 600; }
+.diag-line { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 3px; font-size: 11px; }
+.diag.ok { color: #3ecf8e; }
+.diag.no { color: #98a1b3; }
 .pnl { font-weight: 700; }
 .pnl.up { color: #3ecf8e; }
 .pnl.down { color: #f56565; }

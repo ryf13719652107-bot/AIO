@@ -153,6 +153,7 @@ class StrategyEngine:
         self._run_epoch: int = 0
         self._mark_busy: set[str] = set()
         self._last_entry_cond: dict[tuple[str, str], bool] = {}  # 开仓边沿记忆
+        self._entry_diag: dict[tuple[str, str], dict] = {}  # 5m 收盘开仓判定诊断
 
     # ---------------- 配置 ----------------
     def _feed_intervals(self) -> list[str]:
@@ -558,6 +559,7 @@ class StrategyEngine:
             # 规则1：每次接入（启动）清空开仓边沿记忆，重新记录条件状态，
             # 需条件由不满足变为满足才开单（防启动追单）
             self._last_entry_cond.clear()
+            self._entry_diag.clear()
             self.running = True
             self.started_at = datetime.now(TZ_CN)
             if persist:
@@ -1131,6 +1133,12 @@ class StrategyEngine:
             key = (symbol, direction)
             prev = self._last_entry_cond.get(key)
             self._last_entry_cond[key] = ok
+            self._entry_diag[key] = {
+                "ok": ok,
+                "reason": reason if not ok else "满足",
+                "first": prev is None,
+                "ts": datetime.now(TZ_CN).strftime("%H:%M:%S"),
+            }
             if not ok or prev is None:
                 # prev=None：启动后首次评估仅记录（规则1：接入瞬间不追单）；
                 # 之后每个 5m 收盘重新判定，满足即开（无需 false→true 边沿）
@@ -1677,5 +1685,8 @@ class StrategyEngine:
             "unrealized_pnl": total_pnl,
             "mark_price": mark,
             "legs": leg_views,
+            "entry_diag": {
+                d: self._entry_diag.get((s, d)) for d in DIRECTIONS
+            },
             "indicators": self.indicators[s].snapshot(latest_price=mark or None),
         }
