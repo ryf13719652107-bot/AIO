@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import logging
 import re
 import time
@@ -500,7 +501,8 @@ class StrategyEngine:
             try:
                 raw = row.state_json
                 state = json.loads(raw) if isinstance(raw, str) else dict(raw or {})
-            except Exception:
+            except Exception as e:
+                logger.warning("指标快照解析失败 %s: %s", sym, e)
                 continue
             if not isinstance(state, dict) or not all(tf in state for tf in tfs):
                 continue  # 周期不齐 → 该币走全量 bootstrap
