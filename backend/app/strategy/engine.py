@@ -909,18 +909,18 @@ class StrategyEngine:
             )
 
     async def _ws_watchdog(self):
-        """WS 帧看门狗：行情帧持续停滞时自动重建连接（REST 轮询模式无此任务）。"""
+        """WS 帧看门狗：盯 K 线连接专用帧数（mark 流每秒都在推，不能反映 kline 连接健康）。"""
         stall_rounds = 0
         while self.running:
             await asyncio.sleep(30)
             ws = self.ws
             if ws is None or not self.running:
                 continue
-            frames = ws.frame_count
+            frames = getattr(ws, "kline_frame_count", ws.frame_count)
             if frames == self._ws_last_frames:
                 stall_rounds += 1
                 logger.warning(
-                    "WS 帧停滞 %.0fs (frames=%d, closes=%d)，第 %d 次",
+                    "WS kline 帧停滞 %.0fs (kline_frames=%d, closes=%d)，第 %d 次",
                     stall_rounds * 30, frames, ws.kline_close_count, stall_rounds,
                 )
                 try:

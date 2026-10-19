@@ -55,6 +55,7 @@ class BinanceFuturesWS:
         self._stop = asyncio.Event()
         self._symbol_set: set[str] = set()
         self.frame_count = 0
+        self.kline_frame_count = 0  # 仅 K 线连接帧数（看门狗专用，mark 流不参与）
         self.kline_close_count = 0
         self._sub_id = 1
         self._reconnect_count = 0
@@ -112,8 +113,8 @@ class BinanceFuturesWS:
                 await asyncio.wait_for(self._stop.wait(), timeout=60)
             except asyncio.TimeoutError:
                 logger.info(
-                    "Binance WS 心跳: frames=%d kline_closes=%d",
-                    self.frame_count, self.kline_close_count,
+                    "Binance WS 心跳: frames=%d kline_frames=%d kline_closes=%d",
+                    self.frame_count, self.kline_frame_count, self.kline_close_count,
                 )
 
     def _next_id(self) -> int:
@@ -167,6 +168,7 @@ class BinanceFuturesWS:
                         if self._stop.is_set():
                             break
                         self.frame_count += 1
+                        self.kline_frame_count += 1
                         await self._handle_message(message)
             except asyncio.CancelledError:
                 break
