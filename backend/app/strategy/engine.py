@@ -1592,7 +1592,9 @@ class StrategyEngine:
         await self._log("INFO", symbol, f"[TP6 触发] {direction}/{action.trigger_key} 保本损已武装")
 
         pct = float(action.close_pct)
-        close_qty = pos.quantity * (pct / 100.0)
+        # 文档口径：按"该笔订单总仓位"的百分比（不是当前剩余），5 档合计=100% 正好平完
+        total_qty = pos.initial_quantity or pos.quantity
+        close_qty = min(total_qty * (pct / 100.0), pos.quantity)
         remaining = pos.quantity - close_qty
         if remaining < self.exchange.min_qty(symbol):
             # 剩余过小 → 全平
@@ -1613,11 +1615,12 @@ class StrategyEngine:
         else:
             pnl = (pos.entry_price - fill_price) * close_qty
         side = "SELL" if direction == "LONG" else "BUY"
+        close_ratio = close_qty / pos.quantity if pos.quantity > 0 else 0.0
         await self._record_trade(
             symbol, side, direction, "CLOSE_TP6", close_qty, fill_price,
-            pos.margin * (pct / 100.0), coid, order, realized_pnl=pnl,
+            pos.margin * close_ratio, coid, order, realized_pnl=pnl,
         )
-        pos.partial_close(pct)
+        pos.partial_close(close_ratio * 100.0)
         await self._persist_position(symbol)
         await self._log(
             "INFO", symbol,

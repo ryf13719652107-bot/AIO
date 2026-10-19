@@ -59,6 +59,39 @@ def test_partial_close_proportional():
     assert math_close(pos.margin, 18.0)
 
 
+def test_tp6_ladder_uses_initial_total_and_sums_to_full():
+    """TP6 各档按"该笔订单总仓位"百分比（文档 L25-29），5 档合计正好平完。"""
+    pos = SymbolPosition(symbol="BTCUSDT")
+    pos.open("LONG", 5.0, 100.0, 5.0)
+    pos.add(5.0, 110.0, 5.0, "ema7")     # 总仓 10
+    assert math_close(pos.initial_quantity, 10.0)
+    total = pos.initial_quantity
+    closed = 0.0
+    for key, pct in (("t5m", 10.0), ("t15m", 20.0), ("t30m", 20.0),
+                     ("t60m", 30.0), ("t60m_120m", 20.0)):
+        pos.fire_tp6(key)
+        # 模拟引擎 _do_tp6 的换算
+        close_qty = min(total * pct / 100.0, pos.quantity)
+        ratio = close_qty / pos.quantity if pos.quantity > 0 else 0.0
+        pos.partial_close(ratio * 100.0)
+        closed += close_qty
+    assert math_close(closed, 10.0)
+    assert math_close(pos.quantity, 0.0)
+
+
+def test_initial_quantity_roundtrip_and_legacy_fallback():
+    pos = SymbolPosition(symbol="BTCUSDT")
+    pos.open("LONG", 3.0, 100.0, 3.0)
+    pos.add(2.0, 105.0, 2.0, "ema7")     # 总仓 5
+    pos2 = SymbolPosition.from_dict(pos.to_dict())
+    assert math_close(pos2.initial_quantity, 5.0)
+    # 旧持久化数据无 initial_quantity → 用 quantity 兜底
+    legacy = pos.to_dict()
+    legacy.pop("initial_quantity")
+    pos3 = SymbolPosition.from_dict(legacy)
+    assert math_close(pos3.initial_quantity, 5.0)
+
+
 def test_breakeven_pnl_directions():
     pos = SymbolPosition(symbol="BTCUSDT")
     pos.open("LONG", 1.0, 100.0, 10.0)

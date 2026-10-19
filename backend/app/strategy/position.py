@@ -25,6 +25,7 @@ class SymbolPosition:
     direction: Direction = "FLAT"
 
     quantity: float = 0.0
+    initial_quantity: float = 0.0  # 该笔订单总仓位（TP6 分批比例的分母）
     entry_price: float = 0.0      # 加权开仓均价（保本损基准）
     margin: float = 0.0           # 累计保证金
     opened_at: Optional[datetime] = None
@@ -81,6 +82,7 @@ class SymbolPosition:
         assert self.direction == "FLAT", "该方向已有持仓"
         self.direction = side
         self.quantity = quantity
+        self.initial_quantity = quantity
         self.entry_price = price
         self.margin = margin
         self.opened_at = datetime.utcnow()
@@ -105,6 +107,7 @@ class SymbolPosition:
             (self.entry_price * self.quantity + price * quantity) / total_qty
         )
         self.quantity = total_qty
+        self.initial_quantity += quantity
         self.margin += margin
         self.orders_count += 1
         self.mark_leg_fired(leg_key)
@@ -124,6 +127,7 @@ class SymbolPosition:
         """接管交易所已有仓：默认禁止加仓（无档位记录），TP 正常执行。"""
         self.direction = side
         self.quantity = quantity
+        self.initial_quantity = quantity
         self.entry_price = price
         self.margin = margin
         self.opened_at = self.opened_at or datetime.utcnow()
@@ -144,6 +148,7 @@ class SymbolPosition:
     def close(self):
         self.direction = "FLAT"
         self.quantity = 0.0
+        self.initial_quantity = 0.0
         self.entry_price = 0.0
         self.margin = 0.0
         self.opened_at = None
@@ -160,6 +165,7 @@ class SymbolPosition:
             "symbol": self.symbol,
             "direction": self.direction,
             "quantity": self.quantity,
+            "initial_quantity": self.initial_quantity,
             "entry_price": self.entry_price,
             "margin": self.margin,
             "opened_at_iso": self.opened_at.isoformat() if self.opened_at else None,
@@ -178,6 +184,8 @@ class SymbolPosition:
         pos = cls(symbol=d.get("symbol", ""))
         pos.direction = d.get("direction", "FLAT")
         pos.quantity = float(d.get("quantity", 0.0))
+        # 旧持久化数据无 initial_quantity → 用当前 quantity 兜底
+        pos.initial_quantity = float(d.get("initial_quantity") or d.get("quantity", 0.0))
         pos.entry_price = float(d.get("entry_price", 0.0))
         pos.margin = float(d.get("margin", 0.0))
         iso = d.get("opened_at_iso")
