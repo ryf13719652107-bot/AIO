@@ -244,10 +244,61 @@ class TimeframeIndicators:
             op = opens[i] if opens and i < len(opens) else None
             self.update(c, vol, op)
 
+    def _live_view(self, price: float) -> dict:
+        """用未收盘价格试算实时指标（纯展示，不改任何增量状态）。
+
+        交易判定始终用已收盘数据；这里只做"若现在收盘"的一次性递推预测：
+        - EMA: ema_live = price*k + ema_now*(1-k)
+        - MACD: DIF=EMA12_live-EMA26_live；DEA=DIF_live*k9 + DEA_now*(1-k9)
+        - RSI: Wilder 平滑代入最新 delta
+        - 成交量: 优先用未收盘累计量
+        """
+        out: dict = {}
+        for name, st in (("ema7", self.ema7), ("ema25", self.ema25), ("ema99", self.ema99)):
+            if st.initialized and st.value is not None:
+                k = 2.0 / (st.period + 1.0)
+                out[name] = price * k + st.value * (1.0 - k)
+
+        macd = self.macd
+        if (
+            macd._ema_fast.initialized and macd._ema_slow.initialized
+            and macd._ema_fast.value is not None and macd._ema_slow.value is not None
+            and macd._signal_prev is not None
+        ):
+            kf = 2.0 / (macd.fast + 1.0)
+            ks = 2.0 / (macd.slow + 1.0)
+            k9 = 2.0 / (macd.signal + 1.0)
+            dif = (
+                price * kf + macd._ema_fast.value * (1.0 - kf)
+                - (price * ks + macd._ema_slow.value * (1.0 - ks))
+            )
+            dea = dif * k9 + macd._signal_prev * (1.0 - k9)
+            out["dif"] = dif
+            out["dea"] = dea
+            out["hist"] = dif - dea
+
+        rsi = self.rsi
+        if rsi.initialized and rsi._avg_loss is not None and self.last_close is not None:
+            delta = price - self.last_close
+            gain = max(delta, 0.0)
+            loss = max(-delta, 0.0)
+            p = rsi.period
+            ag = (rsi._avg_gain * (p - 1) + gain) / p
+            al = (rsi._avg_loss * (p - 1) + loss) / p
+            out["rsi"] = 100.0 if al == 0 else 100.0 - 100.0 / (1.0 + ag / al)
+
+        avg = self.volume.avg_prior()
+        vol_display = self.live_volume if self.live_volume is not None else self.volume.latest
+        if vol_display is not None:
+            out["volume"] = vol_display
+        if avg is not None and avg > 0 and vol_display is not None:
+            out["volume_ratio"] = vol_display / avg
+        return out
+
     def snapshot(self, latest_price: Optional[float] = None) -> dict:
         macd = self.macd
         hist_list = list(macd.hist_history)
-        return {
+        snap = {
             "timeframe": self.timeframe,
             "ema7": round(self.ema7.value, 6) if self.ema7.value is not None else None,
             "ema25": round(self.ema25.value, 6) if self.ema25.value is not None else None,
@@ -268,6 +319,13 @@ class TimeframeIndicators:
             "bar_count": self.bar_count,
             "live": self.live_volume is not None or self.live_close is not None,
         }
+        # 实时试算覆盖展示值（仅非 None 项），交易判定不受影响
+        if latest_price and latest_price > 0:
+            for k, v in self._live_view(float(latest_price)).items():
+                if v is not None:
+                    snap[k] = round(v, 6) if isinstance(v, float) else v
+            snap["live"] = True
+        return snap
 
 
 class SymbolIndicators:
@@ -319,7 +377,8 @@ class SymbolIndicators:
         return all(t.ready for t in self.tf.values())
 
     def snapshot(self, latest_price: Optional[float] = None) -> dict:
+        # 所有周期都用实时价试算展示值；收盘值仍是判定依据
         return {
-            tf: ind.snapshot(latest_price if tf == "5m" else None)
+            tf: ind.snapshot(latest_price)
             for tf, ind in self.tf.items()
         }
