@@ -154,6 +154,8 @@ class StrategyEngine:
         self._mark_busy: set[str] = set()
         self._last_entry_cond: dict[tuple[str, str], bool] = {}  # 开仓边沿记忆
         self._entry_diag: dict[tuple[str, str], dict] = {}  # 5m 收盘开仓判定诊断
+        self._ws_watchdog_task: Optional[asyncio.Task] = None
+        self._ws_last_frames: int = -1
 
     # ---------------- 配置 ----------------
     def _feed_intervals(self) -> list[str]:
@@ -628,6 +630,13 @@ class StrategyEngine:
         self._boot_task = None
         self._position_sync_task = None
         self._screener_task = None
+        if self._ws_watchdog_task:
+            self._ws_watchdog_task.cancel()
+            try:
+                await self._ws_watchdog_task
+            except asyncio.CancelledError:
+                pass
+            self._ws_watchdog_task = None
         if self.ws:
             await self.ws.stop()
         if self.poller:
@@ -894,6 +903,33 @@ class StrategyEngine:
                 on_kline_update=self._on_kline_update,
             )
             await self.ws.start()
+            self._ws_last_frames = -1
+            self._ws_watchdog_task = asyncio.create_task(
+                self._ws_watchdog(), name="ws-watchdog",
+            )
+
+    async def _ws_watchdog(self):
+        """WS 帧看门狗：行情帧持续停滞时自动重建连接（REST 轮询模式无此任务）。"""
+        stall_rounds = 0
+        while self.running:
+            await asyncio.sleep(30)
+            ws = self.ws
+            if ws is None or not self.running:
+                continue
+            frames = ws.frame_count
+            if frames == self._ws_last_frames:
+                stall_rounds += 1
+                logger.warning(
+                    "WS 帧停滞 %.0fs (frames=%d, closes=%d)，第 %d 次",
+                    stall_rounds * 30, frames, ws.kline_close_count, stall_rounds,
+                )
+                try:
+                    await ws.update_symbols(self.symbols)
+                except Exception as e:
+                    logger.error("WS 重建失败: %s", e)
+            else:
+                stall_rounds = 0
+            self._ws_last_frames = frames
 
     async def _restart_market_feed(self):
         if not self.running:
@@ -1085,9 +1121,22 @@ class StrategyEngine:
         })
 
         asyncio.create_task(
-            self._handle_interval_close(symbol, interval),
+            self._safe_interval_close(symbol, interval),
             name=f"tf-close-{symbol}-{interval}",
         )
+
+    async def _safe_interval_close(self, symbol: str, interval: str):
+        """收盘评估包装：异常必须进事件流（create_task 默认静默吞异常）。"""
+        try:
+            await self._handle_interval_close(symbol, interval)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.exception("周期收盘评估异常 %s %s: %s", symbol, interval, e)
+            try:
+                await self._log("ERROR", symbol, f"周期收盘评估异常: {e}")
+            except Exception:
+                pass
 
     async def _handle_interval_close(self, symbol: str, interval: str):
         """周期收盘评估：TP（全周期）→ 趋势加仓（15m/30m）→ 开仓（5m）。"""
