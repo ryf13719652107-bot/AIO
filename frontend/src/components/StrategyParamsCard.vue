@@ -147,6 +147,9 @@
         <div class="tp-row">
           <el-checkbox v-model="params.order_plan.enable_first">满足开仓条件直接开首仓</el-checkbox>
         </div>
+        <div class="unit" style="margin-top:4px">
+          关闭「直接开首仓」不影响其他档位：方向条件满足后，由回踩 EMA7/25/99 或 15m/30m 趋势档先行入场开仓。
+        </div>
         <div class="tp-row">
           <el-checkbox v-model="params.order_plan.add_ema7">回踩 ≤5m EMA7（空: ≥）</el-checkbox>
           <el-checkbox v-model="params.order_plan.add_ema25">回踩 ≤5m EMA25 · 仅一次</el-checkbox>

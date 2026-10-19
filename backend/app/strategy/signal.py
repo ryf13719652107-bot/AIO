@@ -329,6 +329,11 @@ class StrategyRules:
 
     # ---------- TP6 实时盯价（mark 试算 RSI，各档仅一次） ----------
     @classmethod
+    def trend_ok(cls, ind: SymbolIndicators, tf: str, long_side: bool) -> bool:
+        """该周期趋势档条件：多 EMA7&25 均>EMA99；空镜像（加仓/入场档共用口径）。"""
+        return _trend_ok(ind.get(tf), long_side)
+
+    @classmethod
     def tp6_live_check(cls, params: StrategyParams, ind: SymbolIndicators,
                        pos: SymbolPosition, mark: float) -> Optional[Action]:
         """TP6 多周期 RSI 分批的实时版：用最新 mark 试算"若现在收盘"的各周期 RSI。

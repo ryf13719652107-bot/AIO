@@ -36,7 +36,7 @@ from app.schemas import (
     StrategyParams, SymbolConfig,
 )
 from app.strategy.indicators import SymbolIndicators
-from app.strategy.position import SymbolPosition
+from app.strategy.position import LEG_FIRST, SymbolPosition
 from app.strategy.screener import SymbolScreener
 from app.strategy.signal import Action, StrategyRules
 
@@ -154,6 +154,8 @@ class StrategyEngine:
         self._mark_busy: set[str] = set()
         self._last_entry_cond: dict[tuple[str, str], bool] = {}  # 开仓边沿记忆
         self._entry_diag: dict[tuple[str, str], dict] = {}  # 5m 收盘开仓判定诊断
+        # 首仓关时的回踩入场武装：(symbol, direction) → set(档key)；趋势破坏即清
+        self._entry_armed: dict[tuple[str, str], set] = {}
         self._ws_watchdog_task: Optional[asyncio.Task] = None
         self._ws_last_frames: int = -1
 
@@ -562,6 +564,7 @@ class StrategyEngine:
             # 需条件由不满足变为满足才开单（防启动追单）
             self._last_entry_cond.clear()
             self._entry_diag.clear()
+            self._entry_armed.clear()
             self.running = True
             self.started_at = datetime.now(TZ_CN)
             if persist:
@@ -1189,15 +1192,14 @@ class StrategyEngine:
                 "ts": datetime.now(TZ_CN).strftime("%H:%M:%S"),
             }
             if not ok:
+                # 条件不再满足：无持仓时清掉回踩入场武装（趋势破坏）
+                if legs[direction].is_flat:
+                    self._entry_armed.pop(key, None)
                 continue
             if prev is None:
                 # prev=None：启动后首次评估仅记录（规则1：接入瞬间不追单）
                 continue
             # 条件满足：被跳过时把原因写进诊断（卡片可见），不再静默
-            if not self.cfg_strategy.order_plan.enable_first:
-                self._entry_diag[key] = {"ok": True, "reason": "满足·首仓开关未启用", "first": False,
-                                         "ts": datetime.now(TZ_CN).strftime("%H:%M:%S")}
-                continue
             if not self.allow_open_for(symbol):
                 self._entry_diag[key] = {"ok": True, "reason": "满足·该币已禁开仓", "first": False,
                                          "ts": datetime.now(TZ_CN).strftime("%H:%M:%S")}
@@ -1206,15 +1208,65 @@ class StrategyEngine:
                 self._entry_diag[key] = {"ok": True, "reason": "满足·该方向已有持仓", "first": False,
                                          "ts": datetime.now(TZ_CN).strftime("%H:%M:%S")}
                 continue
-            act = Action(
-                type="OPEN_LONG" if direction == "LONG" else "OPEN_SHORT",
-                reason=f"开{'多' if direction == 'LONG' else '空'}: {reason}",
-            )
-            try:
-                await self._execute_action(symbol, act, direction)
-            except Exception as e:
-                logger.exception("开仓执行失败 %s %s: %s", symbol, direction, e)
-                await self._log("ERROR", symbol, f"开仓执行失败: {e}")
+            plan = self.cfg_strategy.order_plan
+            long_side = direction == "LONG"
+            open_type = "OPEN_LONG" if direction == "LONG" else "OPEN_SHORT"
+            open_word = "多" if direction == "LONG" else "空"
+            if plan.enable_first:
+                act = Action(
+                    type=open_type,
+                    reason=f"开{open_word}: {reason}",
+                )
+                try:
+                    await self._execute_action(symbol, act, direction)
+                except Exception as e:
+                    logger.exception("开仓执行失败 %s %s: %s", symbol, direction, e)
+                    await self._log("ERROR", symbol, f"开仓执行失败: {e}")
+                continue
+            # 首仓关：9 项方向条件仍是前提，由其他已启用档位入场
+            # 1) 趋势档（15m/30m 收盘趋势成立 → 直接入场一次）
+            entry_leg = None
+            if plan.add_15m and StrategyRules.trend_ok(ind, "15m", long_side):
+                entry_leg = "t15m"
+            elif plan.add_30m and StrategyRules.trend_ok(ind, "30m", long_side):
+                entry_leg = "t30m"
+            if entry_leg:
+                act = Action(
+                    type=open_type,
+                    trigger_key=entry_leg,
+                    reason=(
+                        f"开{open_word}(趋势档入场): {entry_leg[1:]} "
+                        f"EMA7&25 均{'>=' if long_side else '<='}EMA99"
+                    ),
+                )
+                try:
+                    await self._execute_action(symbol, act, direction)
+                except Exception as e:
+                    logger.exception("入场执行失败 %s %s: %s", symbol, direction, e)
+                    await self._log("ERROR", symbol, f"入场执行失败: {e}")
+                continue
+            # 2) 武装回踩档（mark 实时回踩 EMA7/25/99 → 入场）
+            armed = {
+                k for k, on in (
+                    ("ema7", plan.add_ema7),
+                    ("ema25", plan.add_ema25),
+                    ("ema99", plan.add_ema99),
+                ) if on
+            }
+            if armed:
+                self._entry_armed[key] = armed
+                self._entry_diag[key] = {
+                    "ok": True,
+                    "reason": "满足·等回踩" + "/".join(k.upper() for k in sorted(armed)),
+                    "first": False,
+                    "ts": datetime.now(TZ_CN).strftime("%H:%M:%S"),
+                }
+            else:
+                self._entry_diag[key] = {
+                    "ok": True, "reason": "满足·但首仓与各档全关，无入场方式",
+                    "first": False,
+                    "ts": datetime.now(TZ_CN).strftime("%H:%M:%S"),
+                }
 
     async def _on_kline_update(self, symbol: str, interval: str, k: dict):
         """未收盘 K 更新：仅刷新展示用 live 数据，不参与交易判定。"""
@@ -1269,6 +1321,11 @@ class StrategyEngine:
                 for direction in DIRECTIONS:
                     pos = legs[direction]
                     if pos.is_flat:
+                        # 首仓关：已武装的回踩入场档（mark 实时触发，开首仓）
+                        if self._entry_armed.get((symbol, direction)):
+                            await self._entry_pullback_check(
+                                symbol, direction, ind, mark,
+                            )
                         continue
                     params = self._params_for(pos)
 
@@ -1310,6 +1367,35 @@ class StrategyEngine:
         finally:
             self._mark_busy.discard(symbol)
 
+    async def _entry_pullback_check(self, symbol: str, direction: str,
+                                    ind: SymbolIndicators, mark: float):
+        """首仓关时的回踩入场：武装档 mark 触及 5m EMA → 开首仓（该档视为已用）。"""
+        armed = self._entry_armed.get((symbol, direction))
+        if not armed:
+            return
+        long_side = direction == "LONG"
+        t5 = ind.get("5m")
+        for leg in ("ema7", "ema25", "ema99"):
+            if leg not in armed:
+                continue
+            ema_val = getattr(t5, leg).value
+            if ema_val is None:
+                continue
+            hit = mark <= ema_val if long_side else mark >= ema_val
+            if hit:
+                open_type = "OPEN_LONG" if long_side else "OPEN_SHORT"
+                word = "多" if long_side else "空"
+                cmp = "<=" if long_side else ">="
+                act = Action(
+                    type=open_type, trigger_key=leg,
+                    reason=(
+                        f"开{word}(回踩入场): mark={mark:.6f}{cmp}"
+                        f"5m {leg.upper()}={ema_val:.6f}"
+                    ),
+                )
+                await self._execute_action(symbol, act, direction)
+                break
+
     async def set_symbol_enabled(self, symbol: str, enabled: bool) -> None:
         """运行中可热更新：禁用只禁开仓/加仓，已有仓位继续止盈。"""
         symbol = (symbol or "").upper().strip()
@@ -1345,9 +1431,11 @@ class StrategyEngine:
                               direction: Optional[str] = None):
         t = action.type
         if t == "OPEN_LONG":
-            await self._do_open(symbol, "LONG", action.reason)
+            await self._do_open(symbol, "LONG", action.reason,
+                                leg_key=action.trigger_key or LEG_FIRST)
         elif t == "OPEN_SHORT":
-            await self._do_open(symbol, "SHORT", action.reason)
+            await self._do_open(symbol, "SHORT", action.reason,
+                                leg_key=action.trigger_key or LEG_FIRST)
         elif t == "ADD":
             if direction is None:
                 logger.error("ADD 缺少方向: %s", symbol)
@@ -1437,7 +1525,8 @@ class StrategyEngine:
             "ts": datetime.now(TZ_CN).strftime("%H:%M:%S"),
         }
 
-    async def _do_open(self, symbol: str, direction: str, reason: str):
+    async def _do_open(self, symbol: str, direction: str, reason: str,
+                       leg_key: str = LEG_FIRST):
         if not self._trading_ready():
             return
         pos = self.positions[symbol][direction]
@@ -1501,7 +1590,10 @@ class StrategyEngine:
         pos.open(
             direction, fill_qty, fill_price, actual_margin,
             params_snapshot=self.cfg_strategy.model_dump(),
+            leg_key=leg_key,
         )
+        # 回踩入场武装已消费（开仓后其余档位转为加仓档）
+        self._entry_armed.pop((symbol, direction), None)
         await self._persist_position(symbol)
         await self._record_trade(
             symbol, side, direction, "OPEN", fill_qty, fill_price, actual_margin, coid, order,
