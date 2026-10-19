@@ -145,6 +145,12 @@ class SymbolPosition:
         self.tp6_fired.add(key)
         self.breakeven_armed = True
 
+    def undo_fire_tp6(self, key: str):
+        """下单失败回滚：撤销该档标记；若无任何档实际成交则一并撤销保本损武装。"""
+        self.tp6_fired.discard(key)
+        if not self.tp6_fired:
+            self.breakeven_armed = False
+
     def close(self):
         self.direction = "FLAT"
         self.quantity = 0.0

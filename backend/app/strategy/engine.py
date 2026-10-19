@@ -1913,8 +1913,10 @@ class StrategyEngine:
         # 文档口径：按"该笔订单总仓位"的百分比（不是当前剩余），5 档合计=100% 正好平完
         total_qty = pos.initial_quantity or pos.quantity
         close_qty = min(total_qty * (pct / 100.0), pos.quantity)
+        # 必须按交易所 stepSize 取整，否则 -1111 精度拒单
+        close_qty = self.exchange.round_qty(symbol, close_qty)
         remaining = pos.quantity - close_qty
-        if remaining < self.exchange.min_qty(symbol):
+        if close_qty <= 0 or close_qty < self.exchange.min_qty(symbol) or remaining < self.exchange.min_qty(symbol):
             # 剩余过小 → 全平
             await self._do_close_leg(
                 symbol, direction, event="CLOSE_TP6", reason=action.reason,
@@ -1922,9 +1924,17 @@ class StrategyEngine:
             return
 
         coid = self.exchange.gen_client_order_id(prefix=f"tp6-{symbol.lower()[:8]}")
-        order = await self.exchange.close_position(
-            symbol, direction=direction, quantity=close_qty, client_order_id=coid,
-        )
+        try:
+            order = await self.exchange.close_position(
+                symbol, direction=direction, quantity=close_qty, client_order_id=coid,
+            )
+        except Exception as e:
+            # 下单失败 → 回滚该档标记（下秒 RSI 仍满足会自动重试）；
+            # 保本损武装仅在"没有任何档实际成交"时一并撤销
+            pos.undo_fire_tp6(action.trigger_key)
+            await self._persist_position(symbol)
+            await self._log("ERROR", symbol, f"[TP6 分批失败 {direction}/{action.trigger_key}] {e}（档位已回滚，将自动重试）")
+            return
         fill_price = float(order.get("avgPrice") or pos.mark_price or pos.entry_price)
         if fill_price <= 0:
             fill_price = pos.entry_price
@@ -1955,7 +1965,9 @@ class StrategyEngine:
             return
         if event not in CLOSE_EVENTS and not event.startswith("CLOSE_"):
             event = "CLOSE_MANUAL"
-        qty = pos.quantity
+        qty = self.exchange.round_qty(symbol, pos.quantity)
+        if qty <= 0 or qty < self.exchange.min_qty(symbol):
+            qty = self.exchange.round_qty(symbol, pos.quantity + self.exchange.min_qty(symbol))
         coid = self.exchange.gen_client_order_id(prefix=f"close-{symbol.lower()[:8]}")
         order = await self.exchange.close_position(
             symbol, direction=direction, quantity=qty, client_order_id=coid,
