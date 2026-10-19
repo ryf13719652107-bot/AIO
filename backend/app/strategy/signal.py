@@ -326,3 +326,56 @@ class StrategyRules:
                     ),
                 )
         return None
+
+    # ---------- TP6 实时盯价（mark 试算 RSI，各档仅一次） ----------
+    @classmethod
+    def tp6_live_check(cls, params: StrategyParams, ind: SymbolIndicators,
+                       pos: SymbolPosition, mark: float) -> Optional[Action]:
+        """TP6 多周期 RSI 分批的实时版：用最新 mark 试算"若现在收盘"的各周期 RSI。
+
+        口径与收盘版完全一致（档位/阈值/方向/双周期 AND/各档仅一次），
+        仅数据源改为实时试算，满足即触发（先到先执行，不等周期收盘）。
+        """
+        if pos.is_flat or pos.breakeven_armed:
+            return None
+        ex = params.exit
+        if not ex.enable_tp6:
+            return None
+        long_side = pos.direction == "LONG"
+        tp6_cfg = ex.tp6.long if long_side else ex.tp6.short
+        for key, tfs in TP6_LEVEL_TFS.items():
+            if pos.is_tp6_fired(key):
+                continue
+            level = getattr(tp6_cfg, key)
+            if not level.enabled:
+                continue
+            rsis: list[float] = []
+            for tf in tfs:
+                t = ind.get(tf)
+                r = t._live_view(mark).get("rsi")
+                if r is None:
+                    r = t.rsi.value
+                if r is None:
+                    rsis = []
+                    break
+                rsis.append(r)
+            if not rsis:
+                continue
+            hit = (
+                all(r >= level.rsi_threshold for r in rsis)
+                if long_side
+                else all(r <= level.rsi_threshold for r in rsis)
+            )
+            if hit:
+                rsi_txt = "/".join(f"{r:.1f}" for r in rsis)
+                return Action(
+                    type="CLOSE_TP6",
+                    trigger_key=key,
+                    close_pct=level.close_pct,
+                    reason=(
+                        f"TP6实时 {key} RSI={rsi_txt} "
+                        f"{'≥' if long_side else '≤'}{level.rsi_threshold:g} "
+                        f"平{level.close_pct:g}%"
+                    ),
+                )
+        return None

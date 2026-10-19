@@ -343,6 +343,46 @@ def test_tp6_fire_once_per_level():
     assert act is None
 
 
+# ---------- TP6 实时盯价 ----------
+def _live_rsi_ready(ind, tf, avg_gain=1.0, avg_loss=1.0, last_close=100.0):
+    """构造可试算实时 RSI 的内部态（_live_view 需要 _avg_gain/_avg_loss/last_close）。"""
+    t = _set_tf(ind, tf, rsi=50.0, volumes=[1.0] * 31)
+    t.last_close = last_close
+    t.rsi._avg_gain = avg_gain
+    t.rsi._avg_loss = avg_loss
+    return t
+
+
+def test_tp6_live_check_long_triggers_before_close():
+    params = StrategyParams()
+    ind = SymbolIndicators(symbol="TESTUSDT")
+    _live_rsi_ready(ind, "5m")
+    pos = _long_pos()
+    # 收盘 RSI 仅 50（不触发）；mark=200 拉高实时试算 RSI≈95.4 ≥93 → 触发
+    act = StrategyRules.tp6_live_check(params, ind, pos, mark=200.0)
+    assert act is not None and act.type == "CLOSE_TP6"
+    assert act.trigger_key == "t5m" and act.close_pct == 10.0
+    # mark 无变动（=last_close）时实时 RSI=50 → 不触发
+    assert StrategyRules.tp6_live_check(params, ind, pos, mark=100.0) is None
+
+
+def test_tp6_live_check_short_direction_and_armed_guard():
+    params = StrategyParams()
+    ind = SymbolIndicators(symbol="TESTUSDT")
+    _live_rsi_ready(ind, "5m")
+    pos = _short_pos()
+    # 空单：mark 上涨 RSI 升高 → 不满足 ≤10
+    assert StrategyRules.tp6_live_check(params, ind, pos, mark=200.0) is None
+    # 空单：mark=50 → delta=-50 → 实时 RSI≈8.3 ≤10 → 触发
+    act = StrategyRules.tp6_live_check(params, ind, pos, mark=50.0)
+    assert act is not None and act.trigger_key == "t5m" and act.close_pct == 10.0
+    # 保本损武装后不再做 TP6 实时检查
+    pos2 = _short_pos()
+    pos2.fire_tp6("t5m")
+    pos2.breakeven_armed = True
+    assert StrategyRules.tp6_live_check(params, ind, pos2, mark=50.0) is None
+
+
 def test_full_close_priority_over_tp6():
     params = StrategyParams()
     ind = SymbolIndicators(symbol="TESTUSDT")
