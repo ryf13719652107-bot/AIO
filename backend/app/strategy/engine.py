@@ -1188,15 +1188,23 @@ class StrategyEngine:
                 "first": prev is None,
                 "ts": datetime.now(TZ_CN).strftime("%H:%M:%S"),
             }
-            if not ok or prev is None:
-                # prev=None：启动后首次评估仅记录（规则1：接入瞬间不追单）；
-                # 之后每个 5m 收盘重新判定，满足即开（无需 false→true 边沿）
+            if not ok:
                 continue
+            if prev is None:
+                # prev=None：启动后首次评估仅记录（规则1：接入瞬间不追单）
+                continue
+            # 条件满足：被跳过时把原因写进诊断（卡片可见），不再静默
             if not self.cfg_strategy.order_plan.enable_first:
+                self._entry_diag[key] = {"ok": True, "reason": "满足·首仓开关未启用", "first": False,
+                                         "ts": datetime.now(TZ_CN).strftime("%H:%M:%S")}
                 continue
             if not self.allow_open_for(symbol):
+                self._entry_diag[key] = {"ok": True, "reason": "满足·该币已禁开仓", "first": False,
+                                         "ts": datetime.now(TZ_CN).strftime("%H:%M:%S")}
                 continue
             if not legs[direction].is_flat:
+                self._entry_diag[key] = {"ok": True, "reason": "满足·该方向已有持仓", "first": False,
+                                         "ts": datetime.now(TZ_CN).strftime("%H:%M:%S")}
                 continue
             act = Action(
                 type="OPEN_LONG" if direction == "LONG" else "OPEN_SHORT",
@@ -1414,6 +1422,15 @@ class StrategyEngine:
         qty = self.exchange.round_qty(symbol, notional / mark if mark > 0 else 0)
         return qty, mark
 
+    def _set_diag(self, symbol: str, direction: str, reason: str):
+        """把执行层拦截原因回写卡片诊断（默认只显示 ✓可开，用户看不到拦截）。"""
+        self._entry_diag[(symbol, direction)] = {
+            "ok": True,
+            "reason": reason,
+            "first": False,
+            "ts": datetime.now(TZ_CN).strftime("%H:%M:%S"),
+        }
+
     async def _do_open(self, symbol: str, direction: str, reason: str):
         if not self._trading_ready():
             return
@@ -1424,6 +1441,7 @@ class StrategyEngine:
         margin = float(plan.order_margin_usdt)
         avail = await self._capital_available()
         if avail < margin:
+            self._set_diag(symbol, direction, f"可用保证金不足({avail:.2f}<{margin:g}u)")
             await self._log(
                 "WARN", symbol,
                 f"开仓跳过: 可用保证金 {avail:.4f} < 每单 {margin:.4f}",
@@ -1433,6 +1451,7 @@ class StrategyEngine:
         qty, mark = await self._calc_order_qty(symbol, margin)
 
         if qty < self.exchange.min_qty(symbol):
+            self._set_diag(symbol, direction, f"数量低于最小({qty}<{self.exchange.min_qty(symbol)})")
             await self._log(
                 "WARN", symbol,
                 f"开仓跳过: 数量 {qty} < 最小 {self.exchange.min_qty(symbol)} "
@@ -1440,10 +1459,14 @@ class StrategyEngine:
             )
             return
         if qty * mark < self.exchange.min_notional(symbol):
+            mn = self.exchange.min_notional(symbol)
+            self._set_diag(
+                symbol, direction,
+                f"名义不足≈{qty * mark:.0f}<最小{mn:g}(调大每单保证金或杠杆)",
+            )
             await self._log(
                 "WARN", symbol,
-                f"开仓跳过: 名义≈{qty * mark:.2f} < 最小名义 "
-                f"{self.exchange.min_notional(symbol):.2f} "
+                f"开仓跳过: 名义≈{qty * mark:.2f} < 最小名义 {mn:.2f} "
                 f"(保证金={margin:g}u×杠杆，需调大 order_margin_usdt 或杠杆)",
             )
             return

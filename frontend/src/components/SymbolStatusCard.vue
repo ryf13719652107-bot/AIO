@@ -29,7 +29,7 @@
           <template v-for="(d, dir) in runtime.entry_diag" :key="dir">
             <span v-if="d" class="diag" :class="d.ok ? 'ok' : 'no'"
                   :title="`评估时间 ${d.ts}${d.first ? ' · 启动后首次仅记录' : ''}`">
-              {{ dir === 'LONG' ? '多' : '空' }}{{ d.ok ? ' ✓可开' : ` ✗ ${d.reason}` }}{{ d.first ? ' ·首录' : '' }}
+              {{ dir === 'LONG' ? '多' : '空' }}{{ d.ok ? ' ✓可开' : ` ✗ ${d.reason}` }}{{ d.first ? ' ·首录' : '' }}{{ d.ok && d.reason && d.reason !== '满足' ? ` ·${d.reason}` : '' }}
             </span>
           </template>
         </div>
