@@ -416,7 +416,8 @@ class StrategyEngine:
                 if row is None:
                     row = PositionState(symbol=symbol, direction=direction)
                     db.add(row)
-                row.state_json = pos.to_dict()
+                # state_json 列为 Text：显式 JSON 序列化
+                row.state_json = json.dumps(pos.to_dict(), ensure_ascii=False)
                 row.updated_at = datetime.utcnow()
                 await db.commit()
 
@@ -448,7 +449,8 @@ class StrategyEngine:
             if sym not in self.symbols:
                 self.symbols.append(sym)
             try:
-                state = dict(row.state_json or {})
+                raw = row.state_json
+                state = json.loads(raw) if isinstance(raw, str) else dict(raw or {})
             except Exception:
                 state = {}
             pos = SymbolPosition.from_dict(state)
