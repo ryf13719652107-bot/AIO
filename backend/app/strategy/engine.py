@@ -2,8 +2,8 @@
 策略主引擎 — 多周期 EMA/MACD/RSI 策略（v3，双向持仓）。
 
 - K 线订阅 1m/5m/15m/30m/1h/2h；信号周期固定 5m（收盘判定）
-- 开仓边沿触发（防启动追单：启动后首次评估仅记录状态）
-- 首仓 + 5 个加仓档（回踩 mark vs 5m EMA7/25/99 + 15m/30m 趋势），各档仅一次
+- 开仓基础条件 = 5m EMA 上穿/下穿事件（启动前已出现的穿越不算，启动后重新检测）
+- 直接开仓档 + 5 个加仓档（回踩 mark vs 5m EMA7/25/99 + 15m/30m 趋势），各档仅一次
 - TP1-6 全部收盘判定；TP6 分批后武装保本损（mark 触及开仓均价全平）
 - 规则2：开仓时快照策略参数，旧仓按快照管理
 - 规则3：同币多空双向持仓并存
@@ -163,10 +163,15 @@ class StrategyEngine:
         self._backfill_task: Optional[asyncio.Task] = None
         self._run_epoch: int = 0
         self._mark_busy: set[str] = set()
-        self._last_entry_cond: dict[tuple[str, str], bool] = {}  # 开仓边沿记忆
+        # 5m EMA 上穿/下穿记忆：symbol → {"prev": 三对关系|None,
+        # "up": 上穿标志, "down": 下穿标志}——启动前已出现的穿越不算
+        self._ema5_cross: dict[str, dict] = {}
         self._entry_diag: dict[tuple[str, str], dict] = {}  # 5m 收盘开仓判定诊断
-        # 首仓关时的回踩入场武装：(symbol, direction) → set(档key)；趋势破坏即清
+        # 直接开仓关时的回踩入场武装：(symbol, direction) → set(档key)；趋势破坏即清
         self._entry_armed: dict[tuple[str, str], set] = {}
+        # 平仓后反向周期等待：多单平了等空单条件满足过一次才可再多；
+        # 空单平了等多单条件（防平仓后同方向快速重进）
+        self._cycle_wait: dict[tuple[str, str], bool] = {}
         self._ws_watchdog_task: Optional[asyncio.Task] = None
         self._ws_last_frames: int = -1
 
@@ -676,6 +681,13 @@ class StrategyEngine:
                 if legs and all(p.is_flat for p in legs.values()):
                     self.cfg_symbols.pop(sym, None)
                     await self._delete_indicator_state(sym)
+                    # 币种移除：清穿越记忆/入场武装/周期等待/诊断，
+                    # 重新入选后穿越重新检测（不沿用移除前的陈旧标志）
+                    self._ema5_cross.pop(sym, None)
+                    for d in DIRECTIONS:
+                        self._entry_armed.pop((sym, d), None)
+                        self._cycle_wait.pop((sym, d), None)
+                        self._entry_diag.pop((sym, d), None)
 
             self.symbols = new_symbols
             await self._adopt_exchange_positions(tag="选币同步")
@@ -732,11 +744,13 @@ class StrategyEngine:
                     "连接币安 API 超时。请检查网络/代理，确认可访问 fapi.binance.com"
                 ) from e
             self._run_epoch += 1
-            # 规则1：每次接入（启动）清空开仓边沿记忆，重新记录条件状态，
-            # 需条件由不满足变为满足才开单（防启动追单）
-            self._last_entry_cond.clear()
+            # 规则1：每次接入（启动）清空上穿/下穿记忆——启动那一刻之前
+            # 已经出现的上穿下穿都不算，启动后重新检测穿越才可开仓
+            # （防启动追单）；反向穿越自动失效本方向的陈旧穿越标志
+            self._ema5_cross.clear()
             self._entry_diag.clear()
             self._entry_armed.clear()
+            self._cycle_wait.clear()
             self.running = True
             self.started_at = datetime.now(TZ_CN)
             if persist:
@@ -1285,6 +1299,8 @@ class StrategyEngine:
                     f"qty={pos.quantity} pnl={pnl:.2f}",
                 )
                 pos.close()
+                # 平仓后等反向周期：多平了等空单条件、空平了等多单条件
+                self._cycle_wait[(sym, direction)] = True
                 await self._persist_position(sym)
 
         return added
@@ -1399,40 +1415,102 @@ class StrategyEngine:
                         if act is not None and act.type != "NONE":
                             await self._execute_action(symbol, act, direction)
 
-                # 3) 开仓评估（仅 5m 收盘；边沿触发防追单）
+                # 3) 开仓评估（仅 5m 收盘；基础条件为 5m EMA 上穿/下穿事件）
                 if interval == SIGNAL_TIMEFRAME:
                     await self._evaluate_entries(symbol, ind)
 
+    def _update_ema5_cross(self, symbol: str, t5) -> tuple[tuple[bool, ...], tuple[bool, ...]]:
+        """按已收盘 5m K 更新 EMA 上穿/下穿标志（启动后重新检测）。
+
+        跟踪三对 EMA 关系：EMA7×25、EMA7×99、EMA25×99。某对由下方转上方
+        记一次上穿（置 up 并清 down），由上方转下方记一次下穿（置 down 并清
+        up）。首次收盘只记录基准（启动前已出现的穿越不算）；指标不全时
+        保持现状不判定。返回 (up, down) 三元组，顺序同上。
+        """
+        e7, e25, e99 = t5.ema7.value, t5.ema25.value, t5.ema99.value
+        state = self._ema5_cross.setdefault(symbol, {
+            "prev": None,
+            "up": [False, False, False],
+            "down": [False, False, False],
+        })
+        if e7 is None or e25 is None or e99 is None:
+            return tuple(state["up"]), tuple(state["down"])
+        cur = (e7 > e25, e7 > e99, e25 > e99)
+        prev = state["prev"]
+        if prev is not None:
+            for i in range(3):
+                if not prev[i] and cur[i]:
+                    state["up"][i] = True     # 上穿：置上穿、清下穿
+                    state["down"][i] = False
+                elif prev[i] and not cur[i]:
+                    state["down"][i] = True    # 下穿：置下穿、清上穿
+                    state["up"][i] = False
+        state["prev"] = cur
+        return tuple(state["up"]), tuple(state["down"])
+
     async def _evaluate_entries(self, symbol: str, ind: SymbolIndicators):
-        """5m 收盘开仓评估：已启用方向全关则不开；需 false→true 边沿。"""
+        """5m 收盘开仓评估：基础条件 = 5m EMA 上穿/下穿事件。
+
+        启动那一刻之前已经出现的上穿下穿都不算，启动后重新检测穿越；
+        开多基础条件为 5m EMA7 上穿 EMA25 且 EMA7、EMA25 均上穿 EMA99
+        （开空镜像为下穿），其余打勾项同时满足才开仓；反向穿越自动失效
+        本方向的陈旧穿越标志（防追单/防延续状态直接开）。
+        平仓后还需反向周期确认：多单平了等空单基础条件（三对下穿标志全
+        部触发）过一次才可再多；空单平了等多单条件（反方向停用即解锁）。
+        """
         legs = self.positions[symbol]
+        # 更新 5m EMA 上穿/下穿标志，再算两方向条件（反向周期解锁需用对方结果）
+        up_armed, down_armed = self._update_ema5_cross(
+            symbol, ind.get(SIGNAL_TIMEFRAME))
+        base_map: dict[str, tuple] = {"LONG": up_armed, "SHORT": down_armed}
+        ok_map: dict[str, bool] = {}
+        reason_map: dict[str, str] = {}
         for direction in DIRECTIONS:
-            ok, reason = StrategyRules.entry_ready(self.cfg_strategy, ind, direction)
+            ok_map[direction], reason_map[direction] = StrategyRules.entry_ready(
+                self.cfg_strategy, ind, direction,
+                base_armed=base_map[direction],
+            )
+        for direction in DIRECTIONS:
+            ok, reason = ok_map[direction], reason_map[direction]
+            opposite = "SHORT" if direction == "LONG" else "LONG"
             key = (symbol, direction)
-            prev = self._last_entry_cond.get(key)
-            self._last_entry_cond[key] = ok
             self._entry_diag[key] = {
                 "ok": ok,
                 "reason": reason if not ok else "满足",
-                "first": prev is None,
                 "ts": datetime.now(TZ_CN).strftime("%H:%M:%S"),
             }
+            # 平仓后反向周期解锁：多平了等空单条件触发、空平了等多单条件
+            # 触发——对方三对穿越标志全部触发（或对方方向已停用）即解锁
+            if key in self._cycle_wait:
+                opp_enabled = (
+                    self.cfg_strategy.entry.enable_short
+                    if opposite == "SHORT" else self.cfg_strategy.entry.enable_long
+                )
+                if not opp_enabled or all(base_map[opposite]):
+                    del self._cycle_wait[key]
             if not ok:
                 # 条件不再满足：无持仓时清掉回踩入场武装（趋势破坏）
                 if legs[direction].is_flat:
                     self._entry_armed.pop(key, None)
                 continue
-            if prev is None:
-                # prev=None：启动后首次评估仅记录（规则1：接入瞬间不追单）
-                continue
             # 条件满足：被跳过时把原因写进诊断（卡片可见），不再静默
             if not self.allow_open_for(symbol):
-                self._entry_diag[key] = {"ok": True, "reason": "满足·该币已禁开仓", "first": False,
+                self._entry_diag[key] = {"ok": True, "reason": "满足·该币已禁开仓",
                                          "ts": datetime.now(TZ_CN).strftime("%H:%M:%S")}
                 continue
             if not legs[direction].is_flat:
-                self._entry_diag[key] = {"ok": True, "reason": "满足·该方向已有持仓", "first": False,
+                self._entry_diag[key] = {"ok": True, "reason": "满足·该方向已有持仓",
                                          "ts": datetime.now(TZ_CN).strftime("%H:%M:%S")}
+                continue
+            if key in self._cycle_wait:
+                # 平仓后等反向周期：多平后需空单基础条件触发过一次、空平后
+                # 需多单基础条件触发过一次，本方向才可再开（防快速重进）
+                self._entry_diag[key] = {
+                    "ok": True,
+                    "reason": ("满足·多平后等空单条件" if direction == "LONG"
+                               else "满足·空平后等多单条件"),
+                    "ts": datetime.now(TZ_CN).strftime("%H:%M:%S"),
+                }
                 continue
             plan = self.cfg_strategy.order_plan
             long_side = direction == "LONG"
@@ -1449,7 +1527,7 @@ class StrategyEngine:
                     logger.exception("开仓执行失败 %s %s: %s", symbol, direction, e)
                     await self._log("ERROR", symbol, f"开仓执行失败: {e}")
                 continue
-            # 首仓关：9 项方向条件仍是前提，由其他已启用档位入场
+            # 直接开仓关：9 项方向条件仍是前提，由其他已启用档位入场
             # 1) 趋势档（15m/30m 收盘趋势成立 → 直接入场一次）
             entry_leg = None
             if plan.add_15m and StrategyRules.trend_ok(ind, "15m", long_side):
@@ -1484,13 +1562,11 @@ class StrategyEngine:
                 self._entry_diag[key] = {
                     "ok": True,
                     "reason": "满足·等回踩" + "/".join(k.upper() for k in sorted(armed)),
-                    "first": False,
                     "ts": datetime.now(TZ_CN).strftime("%H:%M:%S"),
                 }
             else:
                 self._entry_diag[key] = {
-                    "ok": True, "reason": "满足·但首仓与各档全关，无入场方式",
-                    "first": False,
+                    "ok": True, "reason": "满足·但直接开仓与各档全关，无入场方式",
                     "ts": datetime.now(TZ_CN).strftime("%H:%M:%S"),
                 }
 
@@ -1547,13 +1623,24 @@ class StrategyEngine:
                 for direction in DIRECTIONS:
                     pos = legs[direction]
                     if pos.is_flat:
-                        # 首仓关：已武装的回踩入场档（mark 实时触发，开首仓）
+                        # 直接开仓关：已武装的回踩入场档（mark 实时触发，开仓）
                         if self._entry_armed.get((symbol, direction)):
                             await self._entry_pullback_check(
                                 symbol, direction, ind, mark,
                             )
                         continue
                     params = self._params_for(pos)
+
+                    # 风控强平（按当前配置，mark 实时盯价，先到先执行）：
+                    # 硬止损浮亏率 ≥ 阈值；持仓 ≥ 阈值小时 → 全平
+                    risk_hit = StrategyRules.risk_stop(
+                        self.cfg_strategy.exit, pos, mark, datetime.utcnow(),
+                    )
+                    if risk_hit is not None:
+                        await self._do_close_leg(
+                            symbol, direction, risk_hit[0], reason=risk_hit[1],
+                        )
+                        continue
 
                     # 回踩加仓档（mark 实时判定，各档仅一次）
                     if (
@@ -1595,7 +1682,7 @@ class StrategyEngine:
 
     async def _entry_pullback_check(self, symbol: str, direction: str,
                                     ind: SymbolIndicators, mark: float):
-        """首仓关时的回踩入场：武装档 mark 触及 5m EMA → 开首仓（该档视为已用）。"""
+        """直接开仓关时的回踩入场：武装档 mark 触及 5m EMA → 开仓（该档视为已用）。"""
         armed = self._entry_armed.get((symbol, direction))
         if not armed:
             return
@@ -1747,7 +1834,6 @@ class StrategyEngine:
         self._entry_diag[(symbol, direction)] = {
             "ok": True,
             "reason": reason,
-            "first": False,
             "ts": datetime.now(TZ_CN).strftime("%H:%M:%S"),
         }
 
@@ -1820,6 +1906,8 @@ class StrategyEngine:
         )
         # 回踩入场武装已消费（开仓后其余档位转为加仓档）
         self._entry_armed.pop((symbol, direction), None)
+        # 周期等待已通过（能开仓即已解锁），清掉防遗留
+        self._cycle_wait.pop((symbol, direction), None)
         await self._persist_position(symbol)
         await self._record_trade(
             symbol, side, direction, "OPEN", fill_qty, fill_price, actual_margin, coid, order,
@@ -1981,6 +2069,9 @@ class StrategyEngine:
         )
         await self._log("INFO", symbol, f"[{event} {direction}] qty={qty} pnl={pnl:.2f} | {reason}")
         pos.close()
+        # 平仓后等反向周期：多平了等空单条件满足过一次才可再多；
+        # 空平了等多单条件满足过一次才可再空（防同方向快速重进）
+        self._cycle_wait[(symbol, direction)] = True
         await self._persist_position(symbol)
 
     async def close_all_positions(self, reason: str = "一键平仓") -> dict:

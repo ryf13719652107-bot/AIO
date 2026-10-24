@@ -27,12 +27,13 @@
           <div class="field slider-field">
             <label>每单保证金（USDT，1–100）</label>
             <el-slider v-model="params.order_plan.order_margin_usdt" :min="1" :max="100" :step="1" show-input size="small" />
-            <div class="unit">名义 = 保证金 × 杠杆 · 首仓与各加仓档相同</div>
+            <div class="unit">名义 = 保证金 × 杠杆 · 直接开仓与各加仓档相同</div>
           </div>
         </div>
         <div class="unit" style="margin-top:8px">
           信号周期固定 5 分钟（收盘判定）；K 线订阅 1m/5m/15m/30m/1h/2h。
-          开仓为边沿触发：启动后先记录条件状态，需由不满足变为满足才开单（防启动追单）。
+          开仓基础条件：5分钟EMA7上穿/下穿EMA25、EMA7和EMA25均上穿/下穿EMA99（启动前已出现的穿越不算，需重新检测）；基础条件触发后与其余打勾项同时满足才开仓。
+          平仓后等反向基础条件触发过一次才可再开（多平等空、空平等多）。
         </div>
       </section>
 
@@ -85,6 +86,22 @@
             </div>
             <el-input-number v-model="params.screening.refresh_hours" :min="0.5" :max="24" :step="0.5" size="small" controls-position="right" />
           </div>
+          <div class="param-box">
+            <div class="param-head">
+              <el-switch v-model="params.screening.enable_rsi_2h_high" />
+              <span>120分钟RSI(6) ≥</span>
+            </div>
+            <el-slider v-model="params.screening.rsi_2h_high_threshold" :min="40" :max="80" :step="1" :show-input="true" size="small" :disabled="!params.screening.enable_rsi_2h_high" />
+            <div class="unit">可选 40—80 · 默认 68</div>
+          </div>
+          <div class="param-box">
+            <div class="param-head">
+              <el-switch v-model="params.screening.enable_rsi_2h_low" />
+              <span>120分钟RSI(6) ≤</span>
+            </div>
+            <el-slider v-model="params.screening.rsi_2h_low_threshold" :min="20" :max="60" :step="1" :show-input="true" size="small" :disabled="!params.screening.enable_rsi_2h_low" />
+            <div class="unit">可选 20—60 · 默认 45</div>
+          </div>
         </div>
       </section>
 
@@ -96,8 +113,8 @@
           </div>
           <template v-if="params.entry.enable_long">
             <div class="switch-grid">
-              <el-checkbox v-model="params.entry.long.ema_5m">5m EMA7 &gt; EMA25</el-checkbox>
-              <el-checkbox v-model="params.entry.long.ema_5m_99">5m EMA7&amp;25 均 &gt; EMA99</el-checkbox>
+              <el-checkbox v-model="params.entry.long.ema_5m">5m EMA7 上穿 EMA25</el-checkbox>
+              <el-checkbox v-model="params.entry.long.ema_5m_99">5m EMA7&amp;25 均上穿 EMA99</el-checkbox>
               <el-checkbox v-model="params.entry.long.ema_15m_cross">15m EMA7 &gt; EMA25</el-checkbox>
               <el-checkbox v-model="params.entry.long.ema_15m_over99">15m EMA7&amp;25 均 &gt; EMA99</el-checkbox>
               <el-checkbox v-model="params.entry.long.ema_30m_cross">30m EMA7 &gt; EMA25</el-checkbox>
@@ -121,8 +138,8 @@
           </div>
           <template v-if="params.entry.enable_short">
             <div class="switch-grid">
-              <el-checkbox v-model="params.entry.short.ema_5m">5m EMA7 &lt; EMA25</el-checkbox>
-              <el-checkbox v-model="params.entry.short.ema_5m_99">5m EMA7&amp;25 均 &lt; EMA99</el-checkbox>
+              <el-checkbox v-model="params.entry.short.ema_5m">5m EMA7 下穿 EMA25</el-checkbox>
+              <el-checkbox v-model="params.entry.short.ema_5m_99">5m EMA7&amp;25 均下穿 EMA99</el-checkbox>
               <el-checkbox v-model="params.entry.short.ema_15m_cross">15m EMA7 &lt; EMA25</el-checkbox>
               <el-checkbox v-model="params.entry.short.ema_15m_over99">15m EMA7&amp;25 均 &lt; EMA99</el-checkbox>
               <el-checkbox v-model="params.entry.short.ema_30m_cross">30m EMA7 &lt; EMA25</el-checkbox>
@@ -143,12 +160,12 @@
       </section>
 
       <section class="block">
-        <div class="block-title">下单计划（首仓 + 加仓档 · 每档仅一次 · 每档 1u）</div>
+        <div class="block-title">下单计划（直接开仓 + 加仓档 · 各档互不影响 · 每档 1u）</div>
         <div class="tp-row">
-          <el-checkbox v-model="params.order_plan.enable_first">满足开仓条件直接开首仓</el-checkbox>
+          <el-checkbox v-model="params.order_plan.enable_first">满足开仓条件直接开仓</el-checkbox>
         </div>
         <div class="unit" style="margin-top:4px">
-          关闭「直接开首仓」不影响其他档位：方向条件满足后，由回踩 EMA7/25/99 或 15m/30m 趋势档先行入场开仓。
+          直接开仓只是入场方式之一，哪个关闭都不影响别的开仓：关闭后方向条件满足时，仍由回踩 EMA7/25/99 或 15m/30m 趋势档入场开仓。
         </div>
         <div class="tp-row">
           <el-checkbox v-model="params.order_plan.add_ema7">回踩 ≤5m EMA7（空: ≥）</el-checkbox>
@@ -204,12 +221,27 @@
         </template>
       </section>
 
+      <section class="block">
+        <div class="block-title">风控（实时盯价 · 带打勾可选可不选）</div>
+        <div class="tp-row">
+          <el-checkbox v-model="params.exit.enable_hard_stop">硬止损：每笔订单浮亏 ≥</el-checkbox>
+          <el-input-number v-model="params.exit.hard_stop_loss_pct" :min="1" :max="100" :precision="0" size="small" controls-position="right" :disabled="!params.exit.enable_hard_stop" />
+          <span class="unit">% 强制平仓（默认20%，1—100可调）</span>
+        </div>
+        <div class="tp-row">
+          <el-checkbox v-model="params.exit.enable_time_stop">时间强平：持仓 ≥</el-checkbox>
+          <el-input-number v-model="params.exit.time_stop_hours" :min="6" :max="24" :precision="0" size="small" controls-position="right" :disabled="!params.exit.enable_time_stop" />
+          <span class="unit">小时强制平仓（默认12，6—24可调）</span>
+        </div>
+      </section>
+
       <section class="block hint-block">
         <div class="strategy-hint">
           <p><b>开多（示例全部勾选）：</b>5m EMA多头排列 + RSI&lt;65 + MACD柱0轴下连续收缩 + 四个高周期多头排列 → 开多1u</p>
           <p><b>开空：</b>完全镜像（RSI&gt;50，柱0轴上连续收缩，高周期空头排列）</p>
           <p><b>加仓：</b>回踩 5m EMA7/25/99 各1单 + 15m/30m 趋势档各1单（各仅一次，双向持仓多空并存）</p>
           <p><b>止盈：</b>TP1–5 全平（也是止损）；TP6 分批后保本损盯开仓均价；旧仓按开仓时快照参数管理</p>
+          <p><b>风控：</b>硬止损浮亏达阈值、持仓超时 → 实时盯价强制平仓（按当前配置即时生效）</p>
         </div>
       </section>
     </template>

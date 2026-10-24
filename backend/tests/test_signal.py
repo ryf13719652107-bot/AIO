@@ -163,6 +163,88 @@ def test_entry_high_tf_cross_and_over99_independent():
     assert ok2 and "30m" in reason2
 
 
+# ---------- 开仓基础条件（5m EMA 上穿/下穿事件） ----------
+def test_entry_base_cross_required_not_state():
+    """基础条件是穿越事件：状态延续（EMA7 早已>25）但穿越未重新出现 → 不开。"""
+    params = StrategyParams()
+    ok, _ = StrategyRules.entry_ready(params, _bull_ind(), "LONG",
+                                      base_armed=(False, False, False))
+    assert not ok
+    ok2, _ = StrategyRules.entry_ready(params, _bear_ind(), "SHORT",
+                                       base_armed=(False, False, False))
+    assert not ok2
+
+
+def test_entry_base_cross_all_triggered():
+    """三对穿越标志全部触发（基础条件重新检测过）→ 可开，理由含上穿/下穿。"""
+    params = StrategyParams()
+    ok, reason = StrategyRules.entry_ready(params, _bull_ind(), "LONG",
+                                           base_armed=(True, True, True))
+    assert ok and "上穿" in reason
+    ok2, reason2 = StrategyRules.entry_ready(params, _bear_ind(), "SHORT",
+                                              base_armed=(True, True, True))
+    assert ok2 and "下穿" in reason2
+
+
+def test_entry_base_cross_partial_not_enough():
+    """7×25 已上穿但 7/25×99 未触发 → 基础条件不全不开；关 99 条件后仅 7×25 即可。"""
+    params = StrategyParams()
+    ok, _ = StrategyRules.entry_ready(params, _bull_ind(), "LONG",
+                                      base_armed=(True, False, False))
+    assert not ok
+    params.entry.long.ema_5m_99 = False
+    ok2, _ = StrategyRules.entry_ready(params, _bull_ind(), "LONG",
+                                       base_armed=(True, False, False))
+    assert ok2
+
+
+# ---------- 引擎 5m EMA 上穿/下穿状态机 ----------
+def _cross_engine():
+    """跳过 __init__ 的引擎实例：_update_ema5_cross 只依赖 _ema5_cross。"""
+    from app.strategy.engine import StrategyEngine
+    eng = StrategyEngine.__new__(StrategyEngine)
+    eng._ema5_cross = {}
+    return eng
+
+
+def test_engine_ema5_cross_startup_and_fresh_cross():
+    """启动前已出现的穿越不算：首次收盘只记基准；重新下穿/上穿才触发标志。"""
+    eng = _cross_engine()
+    ind = SymbolIndicators(symbol="TESTUSDT")
+    t5 = ind.get("5m")
+    _set_tf(ind, "5m", e7=105, e25=100, e99=95)      # 启动前已是多头排列
+    up, down = eng._update_ema5_cross("TESTUSDT", t5)
+    assert up == (False, False, False) and down == (False, False, False)
+    up, down = eng._update_ema5_cross("TESTUSDT", t5)  # 状态延续仍不算
+    assert up == (False, False, False) and down == (False, False, False)
+    # 启动后重新下穿：EMA7 跌破 EMA25 与 EMA99（EMA25 仍在 99 上方）
+    _set_tf(ind, "5m", e7=98, e25=100, e99=99)
+    up, down = eng._update_ema5_cross("TESTUSDT", t5)
+    assert down == (True, True, False) and up == (False, False, False)
+    # 再上穿：反向穿越清 down 置 up
+    _set_tf(ind, "5m", e7=105, e25=100, e99=99)
+    up, down = eng._update_ema5_cross("TESTUSDT", t5)
+    assert up == (True, True, False) and down == (False, False, False)
+
+
+def test_engine_ema5_cross_pair_25_99_independent():
+    """三对独立跟踪：EMA25×99 下穿触发 down、重新上穿补齐 up 三对。"""
+    eng = _cross_engine()
+    ind = SymbolIndicators(symbol="TESTUSDT")
+    t5 = ind.get("5m")
+    _set_tf(ind, "5m", e7=90, e25=100, e99=95)       # 基准 (F,F,T)
+    eng._update_ema5_cross("TESTUSDT", t5)
+    _set_tf(ind, "5m", e7=105, e25=100, e99=95)      # 7 上穿 25/99
+    up, down = eng._update_ema5_cross("TESTUSDT", t5)
+    assert up == (True, True, False) and down == (False, False, False)
+    _set_tf(ind, "5m", e7=105, e25=94, e99=95)       # EMA25 下穿 99
+    up, down = eng._update_ema5_cross("TESTUSDT", t5)
+    assert up == (True, True, False) and down == (False, False, True)
+    _set_tf(ind, "5m", e7=105, e25=100, e99=95)      # EMA25 重新上穿 99
+    up, down = eng._update_ema5_cross("TESTUSDT", t5)
+    assert up == (True, True, True) and down == (False, False, False)
+
+
 # ---------- 回踩加仓 ----------
 def test_pullback_long_requires_armed_then_dip():
     params = StrategyParams()
@@ -414,3 +496,88 @@ def test_exit_disabled_tp():
     _set_tf(ind, "5m", e7=90, e25=95, e99=85, volumes=[1.0] * 31)
     pos = _long_pos()
     assert StrategyRules.check_exit(params, ind, pos, "5m") is None
+
+
+# ---------- 风控强平（硬止损 / 时间强平） ----------
+def test_risk_stop_hard_stop():
+    from datetime import datetime, timedelta
+    exit_cfg = StrategyParams().exit
+    pos = _long_pos(entry=100.0)  # qty=1, margin=10
+    # 浮亏率 = (98-100)*1/10 = -20% → 触发硬止损
+    hit = StrategyRules.risk_stop(exit_cfg, pos, mark=98.0)
+    assert hit is not None and hit[0] == "CLOSE_HARD_STOP"
+    # 浮亏率 -10% 不触发
+    assert StrategyRules.risk_stop(exit_cfg, pos, mark=99.0) is None
+    # 关闭硬止损后不触发
+    exit_cfg.enable_hard_stop = False
+    assert StrategyRules.risk_stop(exit_cfg, pos, mark=98.0) is None
+    exit_cfg.enable_hard_stop = True
+    # 空仓不触发
+    flat = SymbolPosition(symbol="TESTUSDT")
+    assert StrategyRules.risk_stop(exit_cfg, flat, mark=98.0) is None
+
+
+def test_risk_stop_time_stop():
+    from datetime import datetime, timedelta
+    exit_cfg = StrategyParams().exit
+    pos = _long_pos()
+    now = datetime.utcnow()
+    # 持仓 1 小时：不触发
+    assert StrategyRules.risk_stop(
+        exit_cfg, pos, mark=100.0, now=now + timedelta(hours=1)) is None
+    # 持仓 ≥12 小时 → 触发时间强平
+    hit = StrategyRules.risk_stop(
+        exit_cfg, pos, mark=100.0, now=now + timedelta(hours=12.5))
+    assert hit is not None and hit[0] == "CLOSE_TIME_STOP"
+    # 关闭时间强平后不触发
+    exit_cfg.enable_time_stop = False
+    assert StrategyRules.risk_stop(
+        exit_cfg, pos, mark=100.0, now=now + timedelta(hours=12.5)) is None
+
+
+# ---------- 选币 120 分钟 RSI(6) 筛选 ----------
+def test_screener_rsi_2h_filter():
+    import asyncio
+    from app.strategy.screener import SymbolScreener
+
+    class FakeExchange:
+        async def get_24h_tickers(self):
+            return [
+                {"symbol": "AAAUSDT", "lastPrice": "1", "quoteVolume": "300"},
+                {"symbol": "BBBUSDT", "lastPrice": "1", "quoteVolume": "200"},
+                {"symbol": "CCCUSDT", "lastPrice": "1", "quoteVolume": "100"},
+            ]
+
+        async def get_usdt_perpetual_symbols(self):
+            return ["AAAUSDT", "BBBUSDT", "CCCUSDT"]
+
+        async def get_klines(self, symbol, interval, limit=200):
+            assert interval == "2h"
+            if symbol == "AAAUSDT":     # 连涨 → RSI=100
+                closes = [100 + i for i in range(31)]
+            elif symbol == "BBBUSDT":   # 连跌 → RSI=0
+                closes = [200 - i for i in range(31)]
+            else:                       # 涨跌交替 → RSI≈50
+                closes = [100 + (i % 2) for i in range(31)]
+            return [[i * 100, "1", "1", "1", str(c), "1", (i + 1) * 100]
+                    for i, c in enumerate(closes)]
+
+    params = StrategyParams()
+    params.screening.enable_mcap = False
+    params.screening.enable_volume = False
+    params.screening.enable_price = False
+    screener = SymbolScreener()
+
+    # 两个区间都开（OR）：连涨/连跌保留，中位 RSI 剔除
+    results = asyncio.run(screener.screen(FakeExchange(), params))
+    assert {r.symbol for r in results} == {"AAAUSDT", "BBBUSDT"}
+
+    # 只开 ≥上限：连跌 BBB 被剔除
+    params.screening.enable_rsi_2h_low = False
+    results2 = asyncio.run(screener.screen(FakeExchange(), params))
+    assert {r.symbol for r in results2} == {"AAAUSDT"}
+
+    # 两个 RSI 筛选都关：全部保留
+    params.screening.enable_rsi_2h_high = False
+    results3 = asyncio.run(screener.screen(FakeExchange(), params))
+    assert {r.symbol for r in results3} == {"AAAUSDT", "BBBUSDT", "CCCUSDT"}

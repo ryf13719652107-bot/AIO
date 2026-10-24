@@ -42,6 +42,10 @@ class ScreeningConfig(BaseModel):
     enable_volume: bool = True
     volume_min_usd: float = 20_000_000.0      # 24h 成交额 2000 万
     volume_max_usd: float = 3_000_000_000.0   # 24h 成交额 30 亿
+    enable_rsi_2h_high: bool = True           # 120 分钟 RSI(6) ≥ 阈值
+    rsi_2h_high_threshold: float = 68.0        # 可选 40-80
+    enable_rsi_2h_low: bool = True             # 120 分钟 RSI(6) ≤ 阈值
+    rsi_2h_low_threshold: float = 45.0         # 可选 20-60
     refresh_hours: float = 1.0
 
 
@@ -81,15 +85,16 @@ class EntryConditionsConfig(BaseModel):
 
 
 class OrderPlanConfig(BaseModel):
-    """下单计划：每单保证金 + 首仓/加仓档（加仓档各仅一次）。
+    """下单计划：每单保证金 + 直接开仓/加仓档（各档互不影响，仅加仓档各一次）。
 
     档位（多单）：回踩 mark ≤ 5m EMA7 / EMA25 / EMA99 各加一单；
     15m / 30m 趋势条件（该周期收盘满足）各加一单。空单镜像。
+    enable_first 关闭不影响其他档位入场（直接开仓只是入场方式之一）。
     """
     model_config = ConfigDict(extra="ignore")
 
     order_margin_usdt: float = Field(default=1.0, ge=1.0, le=100.0)  # 每单保证金 USDT
-    enable_first: bool = True    # 满足开仓条件直接开首仓
+    enable_first: bool = True    # 满足开仓条件直接开仓（不打勾不影响其他档位入场）
     add_ema7: bool = True        # 回踩 ≤5m EMA7（空: ≥）
     add_ema25: bool = True       # 回踩 ≤5m EMA25，仅一次
     add_ema99: bool = True       # 回踩 ≤5m EMA99，仅一次
@@ -151,6 +156,8 @@ class ExitConfig(BaseModel):
     TP3: 5m EMA25<EMA99；TP4: 15m EMA7<EMA25；
     TP5: 5m VOL>前30根均量×倍数；TP6: 多周期 RSI 分批。
     TP6 任一档执行后触发保本损（剩余仓位 mark 触及开仓均价即全平）。
+    硬止损：每笔订单浮亏率 ≥ 阈值 强制平仓（mark 实时盯价）。
+    时间强平：持仓 ≥ 阈值小时 强制平仓。
     """
     model_config = ConfigDict(extra="ignore")
 
@@ -162,6 +169,10 @@ class ExitConfig(BaseModel):
     tp5_vol_mult: float = Field(default=10.0, ge=5.0, le=50.0)  # 放量倍数 5-50
     enable_tp6: bool = True
     tp6: TP6Config = Field(default_factory=TP6Config)
+    enable_hard_stop: bool = True    # 硬止损：浮亏率 ≥ 阈值 强制平仓
+    hard_stop_loss_pct: float = Field(default=20.0, ge=1.0, le=100.0)  # 1-100%
+    enable_time_stop: bool = True    # 时间强平：持仓 ≥ 阈值小时 强制平仓
+    time_stop_hours: float = Field(default=12.0, ge=6.0, le=24.0)  # 6-24 小时
 
 
 class StrategyParams(BaseModel):

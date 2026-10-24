@@ -1,7 +1,9 @@
 """
 多周期 EMA/MACD/RSI 策略规则判定器（v3，双向持仓）。
 
-- 开仓：5m 收盘 K 判定（边沿触发由引擎负责），已启用条件 AND，全部用已收盘数据。
+- 开仓：5m 收盘 K 判定，已启用条件 AND，全部用已收盘数据。
+  5m EMA 基础条件为上穿/下穿事件（启动前已出现的穿越不算，由引擎检测后
+  传入 base_armed；不传时回退为大于/小于状态判定）。
 - 回踩加仓：实时 mark 价对 5m EMA7/25/99，需先站上（多）/跌破（空）EMA 才武装，
   武装后回踩触发，各档仅一次。
 - 趋势加仓：15m/30m 收盘满足 EMA 趋势条件，各仅一次。
@@ -10,9 +12,10 @@
 """
 
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Literal, Optional
 
-from app.schemas import SIGNAL_TIMEFRAME, StrategyParams
+from app.schemas import SIGNAL_TIMEFRAME, ExitConfig, StrategyParams
 from app.strategy.indicators import SymbolIndicators
 from app.strategy.position import SymbolPosition
 
@@ -77,7 +80,9 @@ class StrategyRules:
     # ---------- 开仓（5m 收盘判定） ----------
     @staticmethod
     def entry_ready(params: StrategyParams, ind: SymbolIndicators,
-                    direction: str) -> tuple[bool, str]:
+                    direction: str,
+                    base_armed: Optional[tuple[bool, bool, bool]] = None,
+                    ) -> tuple[bool, str]:
         entry = params.entry
         long_side = direction == "LONG"
         if long_side and not entry.enable_long:
@@ -106,18 +111,26 @@ class StrategyRules:
         e7, e25, e99 = t5.ema7.value, t5.ema25.value, t5.ema99.value
         ema_ready = _val(e7) and _val(e25) and _val(e99)
 
+        # 基础条件 = 5m EMA 上穿/下穿事件：base_armed 为引擎检测的三对穿越
+        # 标志（EMA7×25、EMA7×99、EMA25×99 按方向取上穿/下穿），启动前已
+        # 出现的穿越不算；None 时回退为大于/小于状态判定（兼容独立调用）
+        if base_armed is not None:
+            c_7_25, c_7_99, c_25_99 = base_armed
+        else:
+            c_7_25 = ema_ready and (e7 > e25 if long_side else e7 < e25)
+            c_7_99 = ema_ready and (e7 > e99 if long_side else e7 < e99)
+            c_25_99 = ema_ready and (e25 > e99 if long_side else e25 < e99)
+
         if not require(
             cfg.ema_5m,
-            ema_ready and (e7 > e25 if long_side else e7 < e25),
-            f"5m EMA7{'>' if long_side else '<'}EMA25",
+            c_7_25,
+            f"5m EMA7{'上穿' if long_side else '下穿'}EMA25",
         ):
             return False, ""
         if not require(
             cfg.ema_5m_99,
-            ema_ready and (
-                (e7 > e99 and e25 > e99) if long_side else (e7 < e99 and e25 < e99)
-            ),
-            f"5m EMA7&25{'均>' if long_side else '均<'}EMA99",
+            c_7_99 and c_25_99,
+            f"5m EMA7&25均{'上穿' if long_side else '下穿'}EMA99",
         ):
             return False, ""
 
@@ -232,6 +245,35 @@ class StrategyRules:
                 type="ADD", trigger_key=key,
                 reason=f"{tf} EMA7&25 均{'>' if pos.direction == 'LONG' else '<'}EMA99",
             )
+        return None
+
+    # ---------- 风控强平（mark 实时盯价，按当前配置先到先执行） ----------
+    @staticmethod
+    def risk_stop(exit_cfg: "ExitConfig", pos: SymbolPosition, mark: float,
+                  now: Optional[datetime] = None) -> Optional[tuple[str, str]]:
+        """硬止损：每笔订单浮亏率 = 未实现盈亏/保证金 ≤ -阈值% → 全平。
+
+        时间强平：持仓时长 ≥ 阈值小时 → 全平。返回 (事件, 原因)，不触发
+        返回 None。
+        """
+        if pos.is_flat or pos.quantity <= 0:
+            return None
+        if exit_cfg.enable_hard_stop and mark > 0:
+            ratio = pos.unrealized_pnl_ratio(mark)
+            if ratio <= -exit_cfg.hard_stop_loss_pct / 100.0:
+                return (
+                    "CLOSE_HARD_STOP",
+                    f"硬止损: 浮亏率={ratio * 100:.1f}% "
+                    f"≤ -{exit_cfg.hard_stop_loss_pct:g}%",
+                )
+        if exit_cfg.enable_time_stop and pos.opened_at is not None:
+            held_h = ((now or datetime.utcnow()) - pos.opened_at
+                      ).total_seconds() / 3600.0
+            if held_h >= exit_cfg.time_stop_hours:
+                return (
+                    "CLOSE_TIME_STOP",
+                    f"时间强平: 持仓{held_h:.1f}h ≥ {exit_cfg.time_stop_hours:g}h",
+                )
         return None
 
     # ---------- 止盈（收盘判定；全平优先于 TP6） ----------

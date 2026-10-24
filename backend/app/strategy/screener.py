@@ -1,5 +1,5 @@
 """
-动态选币：CoinGecko 市值 + 币安 24h 成交额/价格。
+动态选币：CoinGecko 市值 + 币安 24h 成交额/价格 + 120 分钟 RSI(6) 区间。
 """
 
 import logging
@@ -10,6 +10,7 @@ import httpx
 
 from app.config import get_settings
 from app.schemas import ScreeningConfig, StrategyParams
+from app.strategy.indicators import RSIState
 
 logger = logging.getLogger(__name__)
 
@@ -72,6 +73,40 @@ class SymbolScreener:
             return symbol[:-4]
         return symbol
 
+    @staticmethod
+    async def _rsi_2h(exchange_client, symbol: str, limit: int = 31) -> Optional[float]:
+        """最近已收盘 2h K 的 RSI(6)（去掉最后一根未收盘 K；失败返回 None 不拦截）。"""
+        try:
+            klines = await exchange_client.get_klines(symbol, "2h", limit)
+        except Exception as e:
+            logger.warning("2h K 线拉取失败 %s: %s", symbol, e)
+            return None
+        rsi = RSIState(period=6)
+        value: Optional[float] = None
+        for k in klines[:-1]:  # 最后一根未收盘，不参与
+            try:
+                value = rsi.update(float(k[4]))
+            except (TypeError, ValueError, IndexError):
+                return None
+        return value
+
+    async def _rsi_2h_filter(self, exchange_client, cfg: ScreeningConfig,
+                             results: list[SymbolScreenResult]) -> list[SymbolScreenResult]:
+        """120 分钟 RSI(6) 区间筛选：≥ 上限阈值 或 ≤ 下限阈值（启用项取 OR）。"""
+        keep: list[SymbolScreenResult] = []
+        for r in results:
+            rsi = await self._rsi_2h(exchange_client, r.symbol)
+            if rsi is None:
+                keep.append(r)  # 数据不可得不拦截（下轮刷新重试）
+                continue
+            ok_high = cfg.enable_rsi_2h_high and rsi >= cfg.rsi_2h_high_threshold
+            ok_low = cfg.enable_rsi_2h_low and rsi <= cfg.rsi_2h_low_threshold
+            if ok_high or ok_low:
+                keep.append(r)
+            else:
+                logger.debug("RSI 筛选剔除 %s: 2h RSI(6)=%.1f", r.symbol, rsi)
+        return keep
+
     async def screen(self, exchange_client, params: StrategyParams, *, refresh_mcap: bool = False) -> list[SymbolScreenResult]:
         cfg: ScreeningConfig = params.screening
         tickers = await exchange_client.get_24h_tickers()
@@ -115,5 +150,9 @@ class SymbolScreener:
             ))
 
         results.sort(key=lambda x: x.volume_24h_usd, reverse=True)
-        logger.info("选币筛选完成: %d 个合格币种", len(results))
+        if cfg.enable_rsi_2h_high or cfg.enable_rsi_2h_low:
+            results = await self._rsi_2h_filter(exchange_client, cfg, results)
+            logger.info("选币筛选完成: %d 个合格币种（含 2h RSI 区间筛选）", len(results))
+        else:
+            logger.info("选币筛选完成: %d 个合格币种", len(results))
         return results
