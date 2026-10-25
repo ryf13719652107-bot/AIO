@@ -94,7 +94,7 @@ def test_entry_single_condition_can_be_disabled():
     params.entry.long.ema_5m_99 = False   # 关掉 均>99
     ind = _bull_ind()
     e7 = ind.get("5m").ema7
-    e7.value = 90  # 故意让 EMA7<EMA25
+    e7.value = 97  # 故意让 EMA7<EMA25（但仍>EMA99，不触发新条件）
     ok, _ = StrategyRules.entry_ready(params, ind, "LONG")
     assert ok
 
@@ -102,7 +102,7 @@ def test_entry_single_condition_can_be_disabled():
 def test_entry_all_toggles_off_disables_side():
     params = StrategyParams()
     cfg = params.entry.long
-    for f in ("ema_5m", "ema_5m_99", "rsi", "macd_dif", "macd_hist",
+    for f in ("ema_5m", "ema_5m_99", "ema_5m_7_99", "rsi", "macd_dif", "macd_hist",
               "ema_15m_cross", "ema_15m_over99", "ema_30m_cross", "ema_30m_over99",
               "ema_60m_cross", "ema_60m_over99", "ema_120m_cross", "ema_120m_over99"):
         setattr(cfg, f, False)
@@ -161,6 +161,59 @@ def test_entry_high_tf_cross_and_over99_independent():
     _set_tf(ind2, "30m", e7=101, e25=105, e99=100)  # 7<25 ✗ 均>99 ✓
     ok2, reason2 = StrategyRules.entry_ready(params2, ind2, "LONG")
     assert ok2 and "30m" in reason2
+
+
+# ---------- 开仓 5m EMA7 vs EMA99 状态条件（独立开关） ----------
+def test_entry_ema5_7_99_blocks_when_unmet():
+    """开关开启：EMA7 未站上/跌破 EMA99（状态）→ 不开。"""
+    params = StrategyParams()
+    ind = _bull_ind()
+    _set_tf(ind, "5m", e7=94, e25=95, e99=100)  # EMA7<EMA99，多头不满足
+    ok, _ = StrategyRules.entry_ready(params, ind, "LONG", base_armed=(True, True, True))
+    assert not ok
+
+    ind2 = _bear_ind()
+    _set_tf(ind2, "5m", e7=106, e25=105, e99=100)  # EMA7>EMA99，空头不满足
+    ok2, _ = StrategyRules.entry_ready(params, ind2, "SHORT", base_armed=(True, True, True))
+    assert not ok2
+
+
+def test_entry_ema5_7_99_reason_includes_label():
+    """开关开启且满足 → 开仓理由包含 EMA7>EMA99。"""
+    params = StrategyParams()
+    ok, reason = StrategyRules.entry_ready(params, _bull_ind(), "LONG",
+                                           base_armed=(True, True, True))
+    assert ok and "EMA7>EMA99" in reason
+    ok2, reason2 = StrategyRules.entry_ready(params, _bear_ind(), "SHORT",
+                                             base_armed=(True, True, True))
+    assert ok2 and "EMA7<EMA99" in reason2
+
+
+def test_entry_ema5_7_99_toggle_off_ignores_state():
+    """开关关闭：EMA7 处于 EMA99 错误侧也不拦截，其余条件满足即开。"""
+    params = StrategyParams()
+    params.entry.long.ema_5m_7_99 = False
+    ind = _bull_ind()
+    _set_tf(ind, "5m", e7=94, e25=95, e99=100)  # EMA7<EMA99 但开关已关
+    ok, _ = StrategyRules.entry_ready(params, ind, "LONG", base_armed=(True, True, True))
+    assert ok
+
+    params2 = StrategyParams()
+    params2.entry.short.ema_5m_7_99 = False
+    ind2 = _bear_ind()
+    _set_tf(ind2, "5m", e7=106, e25=105, e99=100)  # EMA7>EMA99 但开关已关
+    ok2, _ = StrategyRules.entry_ready(params2, ind2, "SHORT", base_armed=(True, True, True))
+    assert ok2
+
+
+def test_entry_ema5_7_99_independent_from_cross():
+    """状态条件与穿越基础条件独立：无穿越标志但状态满足时，该条件自身不拦截。"""
+    params = StrategyParams()
+    params.entry.long.ema_5m = False
+    params.entry.long.ema_5m_99 = False
+    ok, reason = StrategyRules.entry_ready(params, _bull_ind(), "LONG",
+                                           base_armed=(False, False, False))
+    assert ok and "EMA7>EMA99" in reason
 
 
 # ---------- 开仓基础条件（5m EMA 上穿/下穿事件） ----------

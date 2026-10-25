@@ -52,14 +52,15 @@ class ScreeningConfig(BaseModel):
 class SideEntryConfig(BaseModel):
     """单方向开仓条件（启用项 AND；全关禁用该方向）。
 
-    多头口径：5m EMA7>EMA25；EMA7&25 均>EMA99；RSI6<阈值；
-    DIF>DEA；MACD柱<0 且连续3根缩小；高周期 EMA7>25 且均>99。
+    多头口径：5m EMA7>EMA25；EMA7&25 均>EMA99；EMA7>EMA99（状态判定）；
+    RSI6<阈值；DIF>DEA；MACD柱<0 且连续3根缩小；高周期 EMA7>25 且均>99。
     空头完全镜像。
     """
     model_config = ConfigDict(extra="ignore")
 
     ema_5m: bool = True          # 5m EMA7 > EMA25（空: <）
     ema_5m_99: bool = True       # 5m EMA7&25 均 > EMA99（空: 均 <）
+    ema_5m_7_99: bool = True     # 5m EMA7 > EMA99（空: <，状态判定非穿越）
     rsi: bool = True             # 5m RSI(6) 阈值判定
     rsi_threshold: float = 65.0  # 多: RSI<阈值(1-85)；空: RSI>阈值(10-99)
     macd_dif: bool = True        # 5m DIF > DEA（空: <）

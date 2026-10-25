@@ -21,6 +21,7 @@ export function defaultStrategyParams() {
       long: {
         ema_5m: true,        // 5m EMA7 > EMA25
         ema_5m_99: true,     // 5m EMA7&25 均 > EMA99
+        ema_5m_7_99: true,   // 5m EMA7 > EMA99（状态判定）
         rsi: true,           // 5m RSI(6) < 阈值
         rsi_threshold: 65,
         macd_dif: true,      // 5m DIF > DEA
@@ -33,6 +34,7 @@ export function defaultStrategyParams() {
       short: {
         ema_5m: true,        // 5m EMA7 < EMA25
         ema_5m_99: true,     // 5m EMA7&25 均 < EMA99
+        ema_5m_7_99: true,   // 5m EMA7 < EMA99（状态判定）
         rsi: true,           // 5m RSI(6) > 阈值
         rsi_threshold: 50,
         macd_dif: true,      // 5m DIF < DEA

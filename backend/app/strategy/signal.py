@@ -133,6 +133,13 @@ class StrategyRules:
             f"5m EMA7&25均{'上穿' if long_side else '下穿'}EMA99",
         ):
             return False, ""
+        # EMA7 vs EMA99：状态判定（非穿越事件），多 > / 空 <，独立开关
+        if not require(
+            cfg.ema_5m_7_99,
+            ema_ready and (e7 > e99 if long_side else e7 < e99),
+            f"5m EMA7{'>' if long_side else '<'}EMA99",
+        ):
+            return False, ""
 
         rsi = t5.rsi.value
         rsi_ok = rsi is not None and (

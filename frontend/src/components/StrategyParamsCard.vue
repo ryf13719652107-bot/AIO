@@ -115,6 +115,7 @@
             <div class="switch-grid">
               <el-checkbox v-model="params.entry.long.ema_5m">5m EMA7 上穿 EMA25</el-checkbox>
               <el-checkbox v-model="params.entry.long.ema_5m_99">5m EMA7&amp;25 均上穿 EMA99</el-checkbox>
+              <el-checkbox v-model="params.entry.long.ema_5m_7_99">5m EMA7 &gt; EMA99</el-checkbox>
               <el-checkbox v-model="params.entry.long.ema_15m_cross">15m EMA7 &gt; EMA25</el-checkbox>
               <el-checkbox v-model="params.entry.long.ema_15m_over99">15m EMA7&amp;25 均 &gt; EMA99</el-checkbox>
               <el-checkbox v-model="params.entry.long.ema_30m_cross">30m EMA7 &gt; EMA25</el-checkbox>
@@ -140,6 +141,7 @@
             <div class="switch-grid">
               <el-checkbox v-model="params.entry.short.ema_5m">5m EMA7 下穿 EMA25</el-checkbox>
               <el-checkbox v-model="params.entry.short.ema_5m_99">5m EMA7&amp;25 均下穿 EMA99</el-checkbox>
+              <el-checkbox v-model="params.entry.short.ema_5m_7_99">5m EMA7 &lt; EMA99</el-checkbox>
               <el-checkbox v-model="params.entry.short.ema_15m_cross">15m EMA7 &lt; EMA25</el-checkbox>
               <el-checkbox v-model="params.entry.short.ema_15m_over99">15m EMA7&amp;25 均 &lt; EMA99</el-checkbox>
               <el-checkbox v-model="params.entry.short.ema_30m_cross">30m EMA7 &lt; EMA25</el-checkbox>
